@@ -547,3 +547,124 @@ Handler 异常隔离是关键设计：单个 handler 抛出异常不会中断其
 - [ ] 多 Agent 协作与通信
 - [ ] Action 序列化与执行轨迹回放
 - [ ] 插件市场与热加载
+
+## CLI 工具
+
+Nexus 提供命令行 Agent 入口 `nexus`，参考 [opencode](https://github.com/sst/opencode) 和 [pi](https://github.com/sst/pi) 的 CLI 体验设计。
+
+### 安装
+
+```bash
+# 安装 Nexus + CLI 依赖
+pip install -e ".[cli]"
+
+# 验证安装
+nexus --help
+```
+
+### 快速开始
+
+#### 直接执行模式
+
+```bash
+# 设置 API Key（或使用环境变量）
+export NEXUS_API_KEY="sk-xxx"
+
+# 一次性问答
+nexus "帮我用 Python 写一个快速排序函数"
+```
+
+#### 交互式 REPL 模式
+
+```bash
+# 进入交互模式
+nexus
+
+# 进入后可以多轮对话
+> 读取 app.py 的内容
+> 分析这段代码的性能问题
+> 给我写一个优化版本
+> /quit
+```
+
+#### 恢复上次会话
+
+```bash
+nexus --continue
+```
+
+#### 列出历史会话
+
+```bash
+nexus --list-sessions
+```
+
+### 命令参考
+
+#### 命令行参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `prompt` | 直接执行的任务描述（位置参数） | - |
+| `--model` | LLM 模型名称 | `gpt-4o-mini` |
+| `--api-key` | API Key | 环境变量 `NEXUS_API_KEY` |
+| `--base-url` | API 自定义端点 | - |
+| `--system-prompt` | 系统提示词 | 内置编程助理提示 |
+| `--max-steps` | 最大执行步数 | `30` |
+| `--work-dir` | 工作目录 | 当前目录 |
+| `--continue` | 恢复最近会话 | - |
+| `--list-sessions` | 列出历史会话 | - |
+| `-v` / `--verbose` | 显示详细日志 | - |
+| `--debug` | 显示调试日志 | - |
+
+#### 交互模式内置命令
+
+| 命令 | 说明 |
+|------|------|
+| `/clear` | 清空对话上下文，保留工具注册 |
+| `/save` | 手动保存当前会话 |
+| `/tools` | 列出已注册的工具 |
+| `/quit` 或 `quit` | 退出 REPL |
+| `/help` | 显示帮助 |
+| `Ctrl+C` | 中断当前任务（不退出 REPL） |
+| `Ctrl+D` | 退出 REPL |
+
+### 配置管理
+
+支持三级配置（优先级从高到低）：
+
+1. **命令行参数**：`--model gpt-4o --api-key sk-xxx`
+2. **环境变量**：`NEXUS_MODEL`、`NEXUS_API_KEY`、`NEXUS_BASE_URL`、`NEXUS_MAX_STEPS`
+3. **配置文件**：
+   - 项目级：`.nexus.json`（当前目录）
+   - 用户级：`~/.nexus/config.json`
+
+配置文件示例 (`~/.nexus/config.json`)：
+
+```json
+{
+  "model": "gpt-4o-mini",
+  "provider": "openai",
+  "system_prompt": "You are a helpful coding assistant.",
+  "max_steps": 30,
+  "tools": ["read_file", "write_file", "list_dir"]
+}
+```
+
+### CLI 内置工具
+
+CLI Agent 默认注册以下文件系统工具：
+
+| 工具 | 功能 | 关键参数 |
+|------|------|----------|
+| `read_file` | 读取文件（含行号，最多 500 行） | `path`, `start_line`, `end_line` |
+| `write_file` | 写入/覆盖文件 | `path`, `content` |
+| `list_dir` | 列出目录内容 | `path`, `recursive`, `max_depth` |
+| `search_content` | 搜索文件内容（grep） | `pattern`, `path`, `file_pattern` |
+
+### 会话管理
+
+- 退出 REPL 时自动保存会话到 `~/.nexus/sessions/`
+- `nexus --continue` 恢复最近一次会话
+- `nexus --list-sessions` 查看历史会话列表
+- 自动截断超长历史（保留最近 50 轮），防止上下文膨胀
