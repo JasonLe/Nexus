@@ -195,6 +195,7 @@ class Agent:
         self,
         task: str,
         variables: dict[str, Any] | None = None,
+        initial_messages: list[dict[str, Any]] | None = None,
     ) -> AgentState:
         """执行任务。
 
@@ -202,7 +203,8 @@ class Agent:
         执行流程：创建上下文 → 调度循环 → 返回最终状态。
 
         执行前自动将 self.system_prompt（若配置）作为 system 消息注入到
-        initial_messages 中。
+        initial_messages 中。调用方可传入额外的 initial_messages
+        （如之前的对话历史）来保持上下文。
 
         Parameters
         ----------
@@ -210,18 +212,20 @@ class Agent:
             任务描述，驱动 Agent 行为的顶层目标。
         variables : dict[str, Any] or None
             运行时变量（可选），存入 state.variables。
+        initial_messages : list[dict[str, Any]] or None
+            预先填入的对话历史（可选）。会被追加到 system prompt 之后。
 
         Returns
         -------
         AgentState
-            执行完成后的最终状态，包含完整的 messages、steps、tool_calls 等。
-            调用方可通过 state.messages 获取对话历史，
-            通过 state.intermediate_results 获取中间计算和最终结果。
+            执行完成后的最终状态。
         """
-        # 构建 initial_messages：若有 system_prompt，作为第一条消息注入
-        initial_messages: list[dict[str, Any]] = []
+        # 构建 initial_messages：system prompt + 调用方传入的历史
+        messages: list[dict[str, Any]] = []
         if self.system_prompt:
-            initial_messages.append({"role": "system", "content": self.system_prompt})
+            messages.append({"role": "system", "content": self.system_prompt})
+        if initial_messages:
+            messages.extend(initial_messages)
 
         logger.info(
             "Agent.run starting",
@@ -235,7 +239,7 @@ class Agent:
             task=task,
             llm=self.llm,
             policy=self.policy,
-            initial_messages=initial_messages or None,
+            initial_messages=messages or None,
             variables=variables,
             max_steps=self.max_steps,
         )

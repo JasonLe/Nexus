@@ -142,10 +142,15 @@ class Runtime:
         if variables:
             state.variables.update(variables)
 
-        # ---- 2. 写入 initial_messages（如 system prompt）----
+        # ---- 2. 写入 initial_messages（如 system prompt + 历史对话）----
         if initial_messages:
             for msg in initial_messages:
                 state.add_message(msg["role"], msg["content"])
+
+        # ---- 2b. 将当前 task 追加为最后一条 user 消息 ----
+        # initial_messages 可能包含历史对话，但当前 task 是新的用户输入，
+        # 必须作为独立的 user 消息追加，否则 LLM 看不到最新问题。
+        state.add_message("user", task)
 
         # ---- 3. 创建 ExecutionContext ----
         context = ExecutionContext(

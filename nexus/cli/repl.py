@@ -29,7 +29,7 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 
-from nexus.cli.config import CLIConfig
+from nexus.cli.config import NexusConfig
 from nexus.cli.display import DisplayManager
 from nexus.cli.session import SessionManager
 from nexus.core.agent.agent import Agent
@@ -61,24 +61,21 @@ class Repl:
         self,
         agent: Agent,
         display: DisplayManager,
-        config: CLIConfig,
+        config: NexusConfig,
         session_mgr: SessionManager | None = None,
     ) -> None:
         """初始化 REPL。
 
-        配置 prompt_toolkit 的 PromptSession（含历史记录、样式、快捷键、自动补全），
-        并保存 Agent、显示管理器、配置和会话管理器的引用。
-
         Parameters
         ----------
         agent : Agent
-            已配置好 LLM 和工具的 Agent 实例，负责执行用户任务。
+            Agent 实例，负责执行用户任务。
         display : DisplayManager
-            终端显示管理器，负责 Rich 组件渲染。
-        config : CLIConfig
-            CLI 配置，含 model、max_steps、system_prompt 等。
+            终端显示管理器。
+        config : NexusConfig
+            CLI 配置。
         session_mgr : SessionManager | None
-            会话管理器，负责持久化对话历史。为 None 时自动创建默认实例。
+            会话管理器，为 None 时自动创建默认实例。
         """
         self.agent = agent
         self.display = display
@@ -128,8 +125,9 @@ class Repl:
     def _get_key_bindings(self) -> KeyBindings:
         """定义快捷键。
 
-        仅注册 Ctrl+D 退出快捷键。prompt_toolkit 自带 Ctrl+C 中断输入、
-        上下箭头浏览历史等默认快捷键，无需重复注册。
+        - Ctrl+D: 退出 REPL
+        - Esc + Enter: 插入换行符（用于多行输入场景）
+        prompt_toolkit 自带 Ctrl+C 中断、上下箭头历史等默认快捷键。
         """
         kb = KeyBindings()
 
@@ -137,6 +135,11 @@ class Repl:
         def _(event: Any) -> None:
             """Ctrl+D 退出 REPL。"""
             event.app.exit(result=None)
+
+        @kb.add("escape", "enter")
+        def _(event: Any) -> None:
+            """Esc+Enter 在当前光标位置插入换行符。"""
+            event.current_buffer.insert_text("\n")
 
         return kb
 
@@ -174,7 +177,7 @@ class Repl:
                 # 使用 prompt_async 以兼容 asyncio 事件循环
                 user_input: str = await self._session.prompt_async(
                     [("class:prompt", "> ")],  # 提示符样式
-                    multiline=True,  # 支持多行输入（Enter 换行，Esc+Enter 提交）
+                    multiline=False,  # 单行模式：Enter 直接提交，Esc+Enter 插入换行
                 )
             except (EOFError, KeyboardInterrupt):
                 # Ctrl+D → 退出 REPL；Ctrl+C → 退出 REPL（在空输入时）
@@ -298,9 +301,9 @@ class Repl:
                 token_usage["prompt"] += usage.get("prompt_tokens", 0)
                 token_usage["completion"] += usage.get("completion_tokens", 0)
                 token_usage["total"] += usage.get("total_tokens", 0)
-            # 展示 LLM 的文本输出（若有）
+            # AI 回复用亮色渲染，区别于系统状态信息
             if response and hasattr(response, "content") and response.content:
-                self.display.show_info(response.content)
+                self.display.render_response(response.content)
 
         async def on_before_tool(event: Event) -> None:
             """工具调用前：展示工具名称和参数摘要。"""
@@ -349,7 +352,11 @@ class Repl:
         await self.agent.events.subscribe(EventType.ON_FINISH, on_finish)
 
         try:
-            state: AgentState = await self.agent.run(user_input)
+            # 将跨轮对话历史传入 agent，保持多轮上下文
+            state: AgentState = await self.agent.run(
+                user_input,
+                initial_messages=self._conversation_history if self._conversation_history else None,
+            )
 
             # 将本轮对话追加到跨轮历史
             self._conversation_history.append({"role": "user", "content": user_input})
@@ -362,14 +369,6 @@ class Repl:
                 await asyncio.wait_for(finish_event.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 pass  # 事件可能已完成派发，继续处理
-
-            # 展示执行统计
-            duration_ms: float = (time.time() - start_time) * 1000
-            self.display.render_summary(
-                steps=state.current_step,
-                total_tokens=token_usage["total"],
-                duration_ms=duration_ms,
-            )
 
             logger.info(
                 "Task executed",
@@ -424,7 +423,7 @@ class Repl:
 
         elif command == "/clear":
             # 重新创建 Agent（保留 LLM、Policy、配置和工具）
-            from nexus.cli.tools.file_tools import register_all_tools
+            from nexus.cli.main import _register_tools
 
             original_agent = self.agent
             new_agent = Agent(
@@ -436,8 +435,8 @@ class Repl:
                 max_steps=self.config.max_steps,
                 name=original_agent.name,
             )
-            # 重新注册工具
-            register_all_tools(new_agent)
+            # 根据配置文件重新注册工具
+            _register_tools(new_agent, self.config)
             self.agent = new_agent
             self._conversation_history.clear()
             self.display.show_info("上下文已清空，工具已重新注册")

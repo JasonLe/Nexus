@@ -295,18 +295,23 @@ class DisplayManager:
     # ------------------------------------------------------------------
 
     def show_info(self, text: str) -> None:
-        """显示普通信息。
+        """显示普通信息，dim 样式。
 
-        适用于中间状态通知（如"正在连接..."、"已加载 3 个插件"），
-        使用 dim 样式降低视觉权重，不干扰主要输出。
-
-        Parameters
-        ----------
-        text : str
-            信息文本。
+        适用于中间状态通知（如"正在连接..."、"Thinking..."），
+        降低视觉权重，不干扰主要输出。
         """
         self.console.print(Text(text, style="dim"))
         logger.debug("Info displayed", extra={"text": text[:100]})
+
+    def render_response(self, content: str) -> None:
+        """渲染 AI 回复文本，亮色样式。
+
+        与 show_info 的区别：show_info 用 dim 灰色显示状态信息，
+        render_response 用默认亮色显示 AI 的实际回复内容。
+        """
+        if content:
+            self.console.print(Markdown(content))
+            logger.debug("Response rendered", extra={"content_length": len(content)})
 
     def render_streaming_content(self, content: str) -> None:
         """渲染普通文本内容（非流式）。
