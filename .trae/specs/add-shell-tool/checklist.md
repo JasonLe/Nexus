@@ -1,0 +1,10 @@
+- [x] ShellTool 继承 BaseTool，实现 name/description/schema/execute 四个抽象成员
+- [x] 操作系统检测：Windows 使用 cmd.exe /c，macOS/Linux 使用 /bin/bash -c
+- [x] execute() 返回 ToolResult，data 包含 stdout、stderr、exit_code、duration_ms
+- [x] 超时控制：默认 30 秒，超时后终止进程并返回 fail
+- [x] 输出截断：stdout/stderr 各 10000 字符上限，超出追加截断提示
+- [x] schema 定义 command（required）、timeout（optional，integer）、work_dir（optional，string）
+- [x] ShellTool 在 `nexus/cli/tools/__init__.py` 导出
+- [x] `_register_tools` 包含 ShellTool，注入 work_dir，可通过 config.tools.enabled 控制
+- [x] 测试覆盖：成功执行、非零退出码、超时、输出截断、工作目录、参数校验
+- [x] 所有测试通过

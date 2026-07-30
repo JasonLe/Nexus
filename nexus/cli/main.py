@@ -127,11 +127,13 @@ def _register_tools(agent: Agent, config: NexusConfig) -> None:
             ListDirTool,
             SearchContentTool,
         )
+        from nexus.cli.tools.shell_tool import ShellTool
         all_tools = {
             "read_file": ReadFileTool(work_dir=config.work_dir or os.getcwd()),
             "write_file": WriteFileTool(work_dir=config.work_dir or os.getcwd()),
             "list_dir": ListDirTool(),
             "search_content": SearchContentTool(),
+            "shell": ShellTool(work_dir=config.work_dir or os.getcwd()),
         }
         enabled = set(config.tools.enabled) if config.tools.enabled else set(all_tools.keys())
 
