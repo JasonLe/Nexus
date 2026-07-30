@@ -160,54 +160,57 @@ def _run_single(agent: Agent, config: NexusConfig, prompt: str) -> None:
         display = DisplayManager()
         from nexus.core.event.event_types import EventType
 
-        async def on_before_llm(event) -> None:
-            display.show_spinner("Thinking...")
+        display.render_divider()
+        display.render_assistant_header()
+
+        tool_count = 0
 
         async def on_after_llm(event) -> None:
             payload = event.payload
-            content = payload.get("content", "")
-            if content:
-                display.render_streaming_content(content)
+            response = payload.get("response")
+            if response and hasattr(response, "content") and response.content:
+                has_tool_calls = bool(getattr(response, "tool_calls", None))
+                if has_tool_calls:
+                    display.render_thinking(response.content)
+                else:
+                    display.render_response(response.content)
+            elif payload.get("content"):
+                display.render_response(payload["content"])
 
         async def on_before_tool(event) -> None:
-            payload = event.payload
-            tool_name = payload.get("tool_name", "unknown")
-            args = payload.get("args", {})
-            display.show_info(f"  Calling {tool_name}({_format_args(args)})")
+            nonlocal tool_count
+            tool_count += 1
 
         async def on_after_tool(event) -> None:
             payload = event.payload
             tool_name = payload.get("tool_name", "unknown")
+            args = payload.get("args", {})
             result = payload.get("result", "")
-            success = payload.get("success", True)
-            display.render_tool_call(tool_name, {}, str(result)[:200], success=success)
+            error = payload.get("error")
+            if error:
+                display.render_tool_call(
+                    tool_name, args, str(error)[:200],
+                    success=False, index=tool_count,
+                )
+            elif result is not None:
+                display.render_tool_call(
+                    tool_name, args, str(result)[:200],
+                    success=True, index=tool_count,
+                )
 
-        await agent.events.subscribe(EventType.BEFORE_LLM_CALL, on_before_llm)
         await agent.events.subscribe(EventType.AFTER_LLM_CALL, on_after_llm)
         await agent.events.subscribe(EventType.BEFORE_TOOL_CALL, on_before_tool)
         await agent.events.subscribe(EventType.AFTER_TOOL_CALL, on_after_tool)
 
         try:
-            state = await agent.run(prompt)
-            if state.messages:
-                last_msg = state.messages[-1]
-                if last_msg.get("role") == "assistant":
-                    display.show_info("")
-                    display.render_streaming_content(last_msg.get("content", ""))
+            with display.show_spinner("🤔 Nexus is working..."):
+                await agent.run(prompt)
         finally:
-            await agent.events.unsubscribe(EventType.BEFORE_LLM_CALL, on_before_llm)
             await agent.events.unsubscribe(EventType.AFTER_LLM_CALL, on_after_llm)
             await agent.events.unsubscribe(EventType.BEFORE_TOOL_CALL, on_before_tool)
             await agent.events.unsubscribe(EventType.AFTER_TOOL_CALL, on_after_tool)
 
     asyncio.run(_run())
-
-
-def _format_args(args: dict) -> str:
-    if not args:
-        return ""
-    items = [f"{k}={str(v)[:50]}" for k, v in args.items()]
-    return ", ".join(items)
 
 
 def _run_continue(agent: Agent, config: NexusConfig) -> None:

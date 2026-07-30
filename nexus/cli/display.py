@@ -159,16 +159,14 @@ class DisplayManager:
         result: str,
         duration_ms: float = 0,
         success: bool = True,
+        index: int | None = None,
     ) -> None:
-        """渲染工具调用（含参数和结果）。
+        """渲染工具调用（含参数和结果），使用彩色 Panel 包裹 Tree。
 
-        使用 Rich Tree 组件呈现工具调用链：
-        - 根节点用 🔧 前缀 + 工具名 + 关键参数摘要
-        - 子节点用 ✅（成功）或 ❌（失败）+ 结果摘要
-
-        命名决策：
-        - 选择 Tree 而非嵌套 Panel，因为复杂工具调用链天然适合树形结构
-        - 使用 emoji 而非 ANSI 颜色，在不同终端主题下辨识度一致
+        使用 Rich Tree 组件呈现工具调用细节，外层用 Panel 包裹提升视觉辨识度：
+        - 成功时青色边框，失败时红色边框
+        - Panel title 显示工具序号和名称
+        - Tree 根节点展示参数摘要，子节点展示执行结果
 
         Parameters
         ----------
@@ -181,9 +179,10 @@ class DisplayManager:
         duration_ms : float
             工具执行耗时（毫秒），可选。
         success : bool
-            执行是否成功，决定显示 ✅ 还是 ❌。
+            执行是否成功，决定边框颜色和图标。
+        index : int | None
+            工具调用序号（从 1 开始），用于 Panel title 显示。
         """
-        # 构建参数摘要：只展示值，省略过长的参数
         args_summary_parts: list[str] = []
         for k, v in args.items():
             v_str = str(v)
@@ -192,36 +191,96 @@ class DisplayManager:
             args_summary_parts.append(f"{k}={v_str}")
         args_summary = ", ".join(args_summary_parts)
 
-        # 根节点：工具调用标识
         tree = Tree(f"🔧 {tool_name}({args_summary})")
 
-        # 子节点：执行结果
         icon = "✅" if success else "❌"
         duration_str = f" ({duration_ms:.1f}ms)" if duration_ms > 0 else ""
         tree.add(f"{icon} {result}{duration_str}")
 
-        self.console.print(tree)
+        border_style = "cyan" if success else "red"
+        title_prefix = f"🔧 Tool [{index}] " if index is not None else "🔧 Tool "
+        title = f"{title_prefix}{tool_name}"
+        if not success:
+            title = f"❌ Tool [{index}] {tool_name}" if index is not None else f"❌ Tool {tool_name}"
+
+        self.console.print(Panel(
+            tree,
+            title=title,
+            title_align="left",
+            border_style=border_style,
+            padding=(0, 1),
+        ))
         log_fn = logger.info if success else logger.warning
         log_fn("Tool call rendered", extra={"tool_name": tool_name, "success": success})
+
+    # ------------------------------------------------------------------
+    # 对话角色标签 & 分隔线
+    # ------------------------------------------------------------------
+
+    def render_user_message(self, text: str) -> None:
+        """渲染用户消息，绿色边框 Panel + 👤 You 标签。
+
+        用户输入提交后立即调用，将用户消息固定在对话流中，
+        避免输入内容随 prompt 滚动消失在终端历史中。
+
+        Parameters
+        ----------
+        text : str
+            用户输入的原始文本。
+        """
+        self.console.print(Panel(
+            Text(text, style="bold white"),
+            title="👤 You",
+            title_align="left",
+            border_style="green",
+            padding=(0, 1),
+        ))
+        logger.debug("User message rendered", extra={"text_length": len(text)})
+
+    def render_assistant_header(self) -> None:
+        """渲染 AI 回复起始标签 🤖 Nexus。
+
+        在每轮 AI 输出前显示，作为 AI 内容区域的视觉锚点，
+        与用户消息和系统信息形成角色区分。
+        """
+        self.console.print(Text("🤖 Nexus", style="bold cyan"))
+        logger.debug("Assistant header rendered")
+
+    def render_divider(self) -> None:
+        """渲染轮次分隔线（dim 灰色横线）。
+
+        在两轮对话之间显示，用终端宽度的横线提供明确的视觉边界，
+        防止多轮对话内容混在一起。
+        """
+        width = self.console.width or 80
+        self.console.print(Text("─" * width, style="dim"))
+        logger.debug("Divider rendered")
 
     # ------------------------------------------------------------------
     # 思考过程展示
     # ------------------------------------------------------------------
 
     def render_thinking(self, text: str) -> None:
-        """渲染思考过程文本。
+        """渲染思考过程，灰色 dim italic Panel + 🤔 Thinking 标签。
 
-        用 dim 样式区分于正式回复，使 LLM 的"内心独白"在视觉上与
-        最终输出形成层次差异。通常用于展示 reasoning tokens（如 o1 系列）。
+        LLM 在调用工具前的 reasoning text（思考链）通过此方法展示，
+        与正式回复形成明确的视觉层次区分：思考过程低权重、最终回复高权重。
 
         Parameters
         ----------
         text : str
             思考过程文本。
         """
-        thinking = Text(text, style="dim italic")
-        self.console.print(thinking)
-        logger.debug("Thinking text rendered", extra={"text_length": len(text)})
+        if not text.strip():
+            return
+        self.console.print(Panel(
+            Text(text, style="dim italic"),
+            title="🤔 Thinking",
+            title_align="left",
+            border_style="dim",
+            padding=(0, 1),
+        ))
+        logger.debug("Thinking rendered", extra={"text_length": len(text)})
 
     # ------------------------------------------------------------------
     # 错误 / 警告展示

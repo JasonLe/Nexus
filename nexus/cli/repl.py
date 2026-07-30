@@ -19,7 +19,6 @@ Repl 类封装了交互式对话的全部流程：
 from __future__ import annotations
 
 import asyncio
-import time
 from pathlib import Path
 from typing import Any
 
@@ -114,12 +113,10 @@ class Repl:
         """定义 prompt_toolkit 的样式。
 
         使用简洁的配色方案：
-        - 提示符（> ）用绿色加粗，醒目但不刺眼
-        - 内置命令用灰色斜体，降低视觉权重以区分于普通输入
+        - 提示符（❯ ）用绿色加粗，醒目但不刺眼
         """
         return Style.from_dict({
             "prompt": "#00aa00 bold",
-            "cmd": "#888888 italic",
         })
 
     def _get_key_bindings(self) -> KeyBindings:
@@ -176,8 +173,8 @@ class Repl:
             try:
                 # 使用 prompt_async 以兼容 asyncio 事件循环
                 user_input: str = await self._session.prompt_async(
-                    [("class:prompt", "> ")],  # 提示符样式
-                    multiline=False,  # 单行模式：Enter 直接提交，Esc+Enter 插入换行
+                    [("class:prompt", "❯ ")],
+                    multiline=False,
                 )
             except (EOFError, KeyboardInterrupt):
                 # Ctrl+D → 退出 REPL；Ctrl+C → 退出 REPL（在空输入时）
@@ -266,73 +263,76 @@ class Repl:
     # ------------------------------------------------------------------
 
     async def _execute_task(self, user_input: str) -> None:
-        """执行用户任务 —— 流式展示 Agent 执行全过程。
+        """执行用户任务 —— 角色化展示 Agent 执行全过程。
 
-        通过订阅 EventBus 来实现流式展示：
-        - BEFORE_LLM_CALL → 显示 spinner "Thinking..."
-        - AFTER_LLM_CALL → 展示 LLM 响应内容
-        - BEFORE_TOOL_CALL → 显示工具调用信息
-        - AFTER_TOOL_CALL → 显示工具执行结果
-        - ON_FINISH → 显示执行摘要
+        展示流程：
+        1. 渲染用户消息 Panel（绿色边框，👤 You 标签）
+        2. 渲染轮次分隔线 + AI 标签（🤖 Nexus）
+        3. 在 spinner 包裹下执行 Agent.run()，事件回调驱动实时展示：
+           - AFTER_LLM_CALL：有 tool_calls → 渲染思考链（灰色 dim Panel）；
+             无 tool_calls → 渲染最终回复（亮色 Markdown）
+           - AFTER_TOOL_CALL：渲染工具调用 Panel（青色/红色边框）
+           - ON_ERROR：渲染错误 Panel（红色边框）
+        4. 维护跨轮对话历史
 
         事件处理器在 Agent.run() 之前订阅、之后取消，避免跨任务泄露。
         """
-        self.display.show_info("")  # 空行分隔
+        # 渲染用户消息到对话流
+        self.display.render_user_message(user_input)
 
-        # ---- 事件处理器 ----
-        # 使用闭包在 handler 中引用外部变量（如 tool_count、token_usage）
+        # 分隔线 + AI 标签
+        self.display.render_divider()
+        self.display.render_assistant_header()
 
         tool_count: int = 0
         token_usage: dict[str, int] = {"prompt": 0, "completion": 0, "total": 0}
-        start_time: float = time.time()
-
-        # ON_FINISH 标志：用于在主协程中等待 Run 完成
         finish_event: asyncio.Event = asyncio.Event()
 
-        async def on_before_llm(event: Event) -> None:
-            """LLM 调用前：显示思考 spinner。"""
-            self.display.show_info("Thinking...")
-
         async def on_after_llm(event: Event) -> None:
-            """LLM 调用后：展示响应内容并累计 token 用量。"""
+            """LLM 调用后：区分思考链与最终回复。"""
             response = event.payload.get("response")
             usage = event.payload.get("usage")
             if usage:
                 token_usage["prompt"] += usage.get("prompt_tokens", 0)
                 token_usage["completion"] += usage.get("completion_tokens", 0)
                 token_usage["total"] += usage.get("total_tokens", 0)
-            # AI 回复用亮色渲染，区别于系统状态信息
             if response and hasattr(response, "content") and response.content:
-                self.display.render_response(response.content)
+                has_tool_calls = bool(getattr(response, "tool_calls", None))
+                if has_tool_calls:
+                    self.display.render_thinking(response.content)
+                else:
+                    self.display.render_response(response.content)
 
         async def on_before_tool(event: Event) -> None:
-            """工具调用前：展示工具名称和参数摘要。"""
+            """工具调用前：累加计数器（spinner 已显示工作状态，无需额外打印）。"""
             nonlocal tool_count
             tool_count += 1
-            tool_name: str = event.payload.get("tool_name", "unknown")
-            args: dict[str, Any] = event.payload.get("args", {})
-            # 构建参数摘要（截断过长值）
-            arg_parts: list[str] = []
-            for k, v in args.items():
-                v_str = str(v)
-                if len(v_str) > 50:
-                    v_str = v_str[:47] + "..."
-                arg_parts.append(f"{k}={v_str}")
-            arg_summary = ", ".join(arg_parts)
-            self.display.show_info(f"[{tool_count}] 🔧 {tool_name}({arg_summary})")
 
         async def on_after_tool(event: Event) -> None:
-            """工具调用后：展示执行结果。"""
+            """工具调用后：渲染工具调用 Panel。"""
             tool_name: str = event.payload.get("tool_name", "unknown")
+            args: dict[str, Any] = event.payload.get("args", {})
             result = event.payload.get("result")
             error = event.payload.get("error")
             if error:
-                self.display.render_warning(f"  ❌ {tool_name}: {error}")
+                self.display.render_tool_call(
+                    tool_name=tool_name,
+                    args=args,
+                    result=str(error)[:200],
+                    success=False,
+                    index=tool_count,
+                )
             elif result is not None:
                 result_str = str(result)
                 if len(result_str) > 200:
                     result_str = result_str[:197] + "..."
-                self.display.show_info(f"  ✅ {tool_name}: {result_str}")
+                self.display.render_tool_call(
+                    tool_name=tool_name,
+                    args=args,
+                    result=result_str,
+                    success=True,
+                    index=tool_count,
+                )
 
         async def on_error(event: Event) -> None:
             """运行时错误：展示错误信息。"""
@@ -343,8 +343,6 @@ class Repl:
             """Run 完成：设置完成标志。"""
             finish_event.set()
 
-        # ---- 订阅事件 ----
-        await self.agent.events.subscribe(EventType.BEFORE_LLM_CALL, on_before_llm)
         await self.agent.events.subscribe(EventType.AFTER_LLM_CALL, on_after_llm)
         await self.agent.events.subscribe(EventType.BEFORE_TOOL_CALL, on_before_tool)
         await self.agent.events.subscribe(EventType.AFTER_TOOL_CALL, on_after_tool)
@@ -352,23 +350,23 @@ class Repl:
         await self.agent.events.subscribe(EventType.ON_FINISH, on_finish)
 
         try:
-            # 将跨轮对话历史传入 agent，保持多轮上下文
-            state: AgentState = await self.agent.run(
-                user_input,
-                initial_messages=self._conversation_history if self._conversation_history else None,
-            )
+            with self.display.show_spinner("🤔 Nexus is working..."):
+                state: AgentState = await self.agent.run(
+                    user_input,
+                    initial_messages=(
+                        self._conversation_history if self._conversation_history else None
+                    ),
+                )
 
-            # 将本轮对话追加到跨轮历史
             self._conversation_history.append({"role": "user", "content": user_input})
             for msg in state.messages:
                 if msg.get("role") == "assistant":
                     self._conversation_history.append(msg)
 
-            # 等待 ON_FINISH 事件（或超时）
             try:
                 await asyncio.wait_for(finish_event.wait(), timeout=5.0)
             except asyncio.TimeoutError:
-                pass  # 事件可能已完成派发，继续处理
+                pass
 
             logger.info(
                 "Task executed",
@@ -384,8 +382,6 @@ class Repl:
             logger.error("Task execution failed", exc_info=True)
 
         finally:
-            # ---- 取消订阅，防止跨任务事件泄露 ----
-            await self.agent.events.unsubscribe(EventType.BEFORE_LLM_CALL, on_before_llm)
             await self.agent.events.unsubscribe(EventType.AFTER_LLM_CALL, on_after_llm)
             await self.agent.events.unsubscribe(EventType.BEFORE_TOOL_CALL, on_before_tool)
             await self.agent.events.unsubscribe(EventType.AFTER_TOOL_CALL, on_after_tool)
