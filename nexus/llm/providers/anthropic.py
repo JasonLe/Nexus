@@ -4,10 +4,11 @@
 --------
 使用 anthropic Python SDK 对接 Anthropic Messages API。
 Provider 层负责：
-1. 连接管理（api_key + base_url）
+1. 连接管理（api_key + base_url + timeout）
 2. 格式映射（Anthropic SDK 响应 → Nexus LLMResponse / LLMChunk）
 3. Tool calling 转换（Anthropic tool_use block ↔ Nexus ToolCall）
-4. 错误处理（Anthropic 异常 → LLMError）
+4. 错误处理（Anthropic 异常 → LLMError 子类，区分可重试/不可重试）
+5. 重试（指数退避，仅对 LLMRetryableError 子类重试）
 
 此类是 Anthropic 生态的基类——任何使用 Anthropic API 格式的 provider
 （如 MiniMax）只需继承此类并覆写构造函数中的默认值即可。
@@ -32,17 +33,29 @@ Messages 转换（Nexus → Anthropic）:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import Any, AsyncIterator
 
 from anthropic import AsyncAnthropic
 
-from nexus.core.exceptions import LLMError
+from nexus.core.exceptions import (
+    LLMAuthError,
+    LLMError,
+    LLMRateLimitError,
+    LLMRetryableError,
+    LLMServerError,
+    LLMTimeoutError,
+)
+from nexus.llm._retry import with_retry
 from nexus.llm.base import BaseLLM, LLMChunk, LLMResponse, ToolCall, UsageStats
 from nexus.logging import get_logger
 
 logger = get_logger(__name__)
+
+# 默认请求超时（秒）
+DEFAULT_TIMEOUT = 60.0
 
 
 class AnthropicLLM(BaseLLM):
@@ -84,10 +97,16 @@ class AnthropicLLM(BaseLLM):
         api_key: str | None = None,
         base_url: str | None = None,
         model: str | None = None,
+        timeout: float = DEFAULT_TIMEOUT,
+        max_retries: int = 3,
+        context_window_tokens: int = 0,
         **kwargs: Any,
     ) -> None:
         super().__init__()
         self.model = model or self._default_model
+        self._timeout = timeout
+        self._max_retries = max_retries
+        self.context_window_tokens = context_window_tokens
 
         # api_key 读取顺序：显式传入 > 环境变量
         resolved_key = api_key or os.getenv(self._env_key)
@@ -99,7 +118,7 @@ class AnthropicLLM(BaseLLM):
         # base_url 读取顺序：显式传入 > 类默认 > SDK 默认
         effective_base_url = base_url or self._default_base_url
 
-        client_kwargs: dict[str, Any] = {}
+        client_kwargs: dict[str, Any] = {"timeout": timeout}
         if resolved_key:
             client_kwargs["api_key"] = resolved_key
         if effective_base_url:
@@ -108,11 +127,45 @@ class AnthropicLLM(BaseLLM):
 
         self._client = AsyncAnthropic(**client_kwargs)
         logger.info(
-            "%s initialized: model=%s, base_url=%s",
+            "%s initialized: model=%s, base_url=%s, timeout=%ss, max_retries=%d",
             type(self).__name__,
             self.model,
             effective_base_url or "(default)",
+            timeout,
+            max_retries,
         )
+
+    # ------------------------------------------------------------------
+    # 错误转换
+    # ------------------------------------------------------------------
+
+    def _convert_exception(self, e: Exception, operation: str) -> LLMError:
+        """将 Anthropic SDK 异常转换为 Nexus LLMError 子类。
+
+        根据 HTTP 状态码 / 异常类型区分可重试与不可重试：
+        - 401/403 → LLMAuthError（不可重试）
+        - 429     → LLMRateLimitError（可重试）
+        - 5xx     → LLMServerError（可重试）
+        - 超时    → LLMTimeoutError（可重试）
+        - 其他    → LLMError（不可重试）
+        """
+        msg = f"{type(self).__name__} {operation} failed: {e}"
+
+        # Anthropic SDK 的 APIStatusError 携带 status_code
+        status_code = getattr(e, "status_code", None)
+
+        if status_code is not None:
+            if status_code in (401, 403):
+                return LLMAuthError(msg)
+            if status_code == 429:
+                return LLMRateLimitError(msg)
+            if 500 <= status_code < 600:
+                return LLMServerError(msg)
+        # asyncio 超时
+        if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+            return LLMTimeoutError(msg)
+        # 兜底为不可重试的普通 LLMError
+        return LLMError(msg)
 
     # ------------------------------------------------------------------
     # chat()
@@ -127,37 +180,48 @@ class AnthropicLLM(BaseLLM):
         """发送对话消息并获取完整响应。
 
         内部完成 Nexus → Anthropic 格式转换并调用 Anthropic SDK。
+        支持指数退避重试（仅对可重试错误：429/5xx/超时）。
         """
+        # 先按 context window 截断历史消息（OpenAI 格式阶段）
+        messages = self._maybe_truncate_messages(messages)
+        # 分离 system prompt 并转换为 Anthropic messages 格式
+        system_prompt, anthropic_messages = self._split_system_messages(messages)
+
+        params: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": kwargs.pop("max_tokens", 4096),
+            "messages": anthropic_messages,
+        }
+
+        if system_prompt:
+            params["system"] = system_prompt
+
+        if tools:
+            params["tools"] = self._convert_tools_to_anthropic(tools)
+
+        params.update(kwargs)
+
+        async def _do_call() -> Any:
+            try:
+                return await self._client.messages.create(**params)
+            except Exception as e:
+                raise self._convert_exception(e, "chat") from e
+
         try:
-            # 分离 system prompt 并转换为 Anthropic messages 格式
-            system_prompt, anthropic_messages = self._split_system_messages(messages)
-
-            params: dict[str, Any] = {
-                "model": self.model,
-                "max_tokens": kwargs.pop("max_tokens", 4096),
-                "messages": anthropic_messages,
-            }
-
-            if system_prompt:
-                params["system"] = system_prompt
-
-            if tools:
-                params["tools"] = self._convert_tools_to_anthropic(tools)
-
-            params.update(kwargs)
-
-            response = await self._client.messages.create(**params)
-
+            response = await with_retry(
+                _do_call,
+                max_retries=self._max_retries,
+                operation_name=f"{type(self).__name__} chat",
+            )
             return self._parse_response(response)
-
-        except Exception as e:
+        except LLMError:
             logger.error(
-                "%s API call failed",
+                "%s chat failed",
                 type(self).__name__,
                 extra={"model": self.model},
                 exc_info=True,
             )
-            raise LLMError(f"{type(self).__name__} API call failed: {e}") from e
+            raise
 
     # ------------------------------------------------------------------
     # stream_chat()
@@ -169,8 +233,21 @@ class AnthropicLLM(BaseLLM):
         tools: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[LLMChunk]:
-        """流式对话 —— 逐步返回 LLM 生成内容和工具调用增量。"""
+        """流式对话 —— 逐步返回 LLM 生成内容和工具调用增量。
+
+        增量语义说明
+        ------------
+        - ``delta_content`` 为**本事件的增量文本**（非累积），下游按增量拼接即可。
+        - ``delta_tool_calls`` 为当前已聚合的 tool_calls **累积状态**：
+          Anthropic 的 tool_use 参数通过 ``input_json_delta`` 分片传输，
+          无法逐片解析为完整 JSON，故每个 chunk 返回当前累积状态，
+          下游应以最后一个 chunk 为准。
+        - tool_use 的 ``arguments`` 在 ``content_block_stop`` 后才完整可解析，
+          传输中用空 dict 占位，避免 JSONDecodeError。
+        """
         try:
+            # 先按 context window 截断历史消息（OpenAI 格式阶段）
+            messages = self._maybe_truncate_messages(messages)
             system_prompt, anthropic_messages = self._split_system_messages(messages)
 
             params: dict[str, Any] = {
@@ -188,12 +265,14 @@ class AnthropicLLM(BaseLLM):
 
             params.update(kwargs)
 
-            accumulated_text = ""
             pending_tool_calls: dict[int, dict[str, Any]] = {}
             final_stop_reason: str | None = None
 
             async with self._client.messages.stream(**params) as stream:
                 async for event in stream:
+                    delta_content = ""
+                    delta_tool_calls: list[ToolCall] = []
+
                     if event.type == "content_block_start":
                         block = event.content_block
                         if block.type == "tool_use":
@@ -205,34 +284,42 @@ class AnthropicLLM(BaseLLM):
                     elif event.type == "content_block_delta":
                         delta = event.delta
                         if delta.type == "text_delta":
-                            accumulated_text += delta.text
+                            # P0-2 修复：传增量文本而非累积全文
+                            delta_content = delta.text
                         elif delta.type == "input_json_delta":
                             if event.index in pending_tool_calls:
                                 pending_tool_calls[event.index]["arguments"] += (
                                     delta.partial_json
                                 )
                     elif event.type == "content_block_stop":
-                        pass
+                        # content_block_stop 后该 index 的 arguments 已完整，
+                        # 尝试解析并输出最终 tool_call
+                        if event.index in pending_tool_calls:
+                            tc_data = pending_tool_calls[event.index]
+                            parsed_args: dict[str, Any] = {}
+                            if tc_data["arguments"]:
+                                try:
+                                    parsed_args = json.loads(tc_data["arguments"])
+                                except json.JSONDecodeError:
+                                    parsed_args = {}
+                            delta_tool_calls.append(ToolCall(
+                                id=tc_data["id"],
+                                name=tc_data["name"],
+                                arguments=parsed_args,
+                            ))
                     elif event.type == "message_stop":
                         if hasattr(event, "message") and event.message:
                             final_stop_reason = self._map_stop_reason(
                                 event.message.stop_reason
                             )
 
-                    delta_tool_calls: list[ToolCall] = []
-                    for tc_data in pending_tool_calls.values():
-                        if tc_data["name"]:
-                            delta_tool_calls.append(ToolCall(
-                                id=tc_data["id"],
-                                name=tc_data["name"],
-                                arguments={},
-                            ))
-
-                    yield LLMChunk(
-                        delta_content=accumulated_text,
-                        delta_tool_calls=delta_tool_calls,
-                        finish_reason=final_stop_reason,
-                    )
+                    # 仅在有增量内容或结束信号时 yield，避免空 chunk
+                    if delta_content or delta_tool_calls or final_stop_reason:
+                        yield LLMChunk(
+                            delta_content=delta_content,
+                            delta_tool_calls=delta_tool_calls,
+                            finish_reason=final_stop_reason,
+                        )
 
         except Exception as e:
             logger.error(
@@ -241,7 +328,7 @@ class AnthropicLLM(BaseLLM):
                 extra={"model": self.model},
                 exc_info=True,
             )
-            raise LLMError(f"{type(self).__name__} stream_chat failed: {e}") from e
+            raise self._convert_exception(e, "stream_chat") from e
 
     # ------------------------------------------------------------------
     # 内部辅助方法

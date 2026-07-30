@@ -62,6 +62,48 @@ class LLMError(NexusError):
     --------------
     - 根据异常属性决定是否重试（幂等请求）、切换 provider 或降级处理。
     - 建议检查 ``__cause__`` 或 ``__context__`` 获取原始 provider 异常信息。
+    - 可通过 ``isinstance(e, LLMRetryableError)`` 判断是否值得重试。
+    """
+
+
+class LLMRetryableError(LLMError):
+    """可重试的 LLM 异常基类。
+
+    所有"因临时性故障导致、重试有望成功"的异常继承此类。
+    重试层（如指数退避）通过 ``isinstance(e, LLMRetryableError)`` 判断
+    是否对该异常进行重试，避免对不可重试错误（如鉴权失败）做无意义重试。
+
+    子类：LLMRateLimitError、LLMTimeoutError、LLMServerError。
+    """
+
+
+class LLMRateLimitError(LLMRetryableError):
+    """触发 API 速率限制（HTTP 429）。
+
+    重试建议：指数退避 + 较长基础间隔，尊重 Retry-After 头（若存在）。
+    """
+
+
+class LLMTimeoutError(LLMRetryableError):
+    """LLM 请求超时。
+
+    包括客户端超时（asyncio.wait_for 触发）和服务端超时（gateway timeout）。
+    重试建议：可立即重试或适度增加超时阈值。
+    """
+
+
+class LLMServerError(LLMRetryableError):
+    """LLM 服务端错误（HTTP 5xx）。
+
+    包括 500/502/503/504 等服务端临时性故障。
+    重试建议：指数退避，最多 3 次。
+    """
+
+
+class LLMAuthError(LLMError):
+    """LLM 鉴权失败（HTTP 401/403）。
+
+    不可重试。API key 无效/过期/权限不足，需用户介入修正配置。
     """
 
 

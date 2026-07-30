@@ -4,10 +4,11 @@
 --------
 包装 openai Python SDK，将 OpenAI 的请求/响应格式映射为 Nexus 统一的数据结构。
 Provider 层负责：
-1. SDK 调用和连接管理
+1. SDK 调用和连接管理（含超时控制）
 2. 响应格式转换（OpenAI API -> LLMResponse/LLMChunk/UsageStats/ToolCall）
-3. 错误处理（将 openai 异常包装为 LLMError）
-4. 参数透传（兼容未来需要的高级参数如 temperature/top_p/max_tokens）
+3. 错误处理（将 openai 异常包装为 LLMError 子类，区分可重试/不可重试）
+4. 重试（指数退避，仅对 LLMRetryableError 子类重试）
+5. 参数透传（兼容未来需要的高级参数如 temperature/top_p/max_tokens）
 
 流式聚合策略
 ------------
@@ -19,17 +20,29 @@ OpenAI 的流式 tool calling 会将 tool_choice 分散到多个 chunk 中，
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import Any, AsyncIterator
 
 from openai import AsyncOpenAI
 
-from nexus.core.exceptions import LLMError
+from nexus.core.exceptions import (
+    LLMAuthError,
+    LLMError,
+    LLMRateLimitError,
+    LLMRetryableError,
+    LLMServerError,
+    LLMTimeoutError,
+)
+from nexus.llm._retry import with_retry
 from nexus.llm.base import BaseLLM, LLMChunk, LLMResponse, ToolCall, UsageStats
 from nexus.logging import get_logger
 
 logger = get_logger(__name__)
+
+# 默认请求超时（秒）
+DEFAULT_TIMEOUT = 60.0
 
 
 class OpenAILLM(BaseLLM):
@@ -46,6 +59,10 @@ class OpenAILLM(BaseLLM):
         自定义 API endpoint，用于代理或兼容网关（如 LiteLLM）。
     model : str
         默认模型名称，默认为 ``"gpt-4o-mini"``。
+    timeout : float
+        请求超时（秒），默认 60。
+    max_retries : int
+        最大重试次数（仅对可重试错误重试），默认 3。
     **kwargs : Any
         透传给 ``AsyncOpenAI`` 构造函数的其他参数。
     """
@@ -55,11 +72,17 @@ class OpenAILLM(BaseLLM):
         api_key: str | None = None,
         base_url: str | None = None,
         model: str = "gpt-4o-mini",
+        timeout: float = DEFAULT_TIMEOUT,
+        max_retries: int = 3,
+        context_window_tokens: int = 0,
         **kwargs: Any,
     ) -> None:
         super().__init__()
 
         self.model = model
+        self._timeout = timeout
+        self._max_retries = max_retries
+        self.context_window_tokens = context_window_tokens
 
         # 若未显式提供 api_key，从环境变量 OPENAI_API_KEY 读取
         resolved_key = api_key or os.getenv("OPENAI_API_KEY")
@@ -68,7 +91,7 @@ class OpenAILLM(BaseLLM):
                 "No API key provided and OPENAI_API_KEY env var is not set"
             )
 
-        client_kwargs: dict[str, Any] = {}
+        client_kwargs: dict[str, Any] = {"timeout": timeout}
         if resolved_key:
             client_kwargs["api_key"] = resolved_key
         if base_url:
@@ -76,6 +99,38 @@ class OpenAILLM(BaseLLM):
         client_kwargs.update(kwargs)
 
         self.client = AsyncOpenAI(**client_kwargs)
+
+    # ------------------------------------------------------------------
+    # 错误转换
+    # ------------------------------------------------------------------
+
+    def _convert_exception(self, e: Exception, operation: str) -> LLMError:
+        """将 OpenAI SDK 异常转换为 Nexus LLMError 子类。
+
+        根据 HTTP 状态码 / 异常类型区分可重试与不可重试：
+        - 401/403 → LLMAuthError（不可重试）
+        - 429     → LLMRateLimitError（可重试）
+        - 5xx     → LLMServerError（可重试）
+        - 超时    → LLMTimeoutError（可重试）
+        - 其他    → LLMError（不可重试）
+        """
+        msg = f"OpenAI {operation} failed: {e}"
+
+        # OpenAI SDK 的 APIStatusError 携带 status_code
+        status_code = getattr(e, "status_code", None)
+
+        if status_code is not None:
+            if status_code in (401, 403):
+                return LLMAuthError(msg)
+            if status_code == 429:
+                return LLMRateLimitError(msg)
+            if 500 <= status_code < 600:
+                return LLMServerError(msg)
+        # asyncio 超时
+        if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+            return LLMTimeoutError(msg)
+        # 兜底为不可重试的普通 LLMError
+        return LLMError(msg)
 
     async def chat(
         self,
@@ -86,7 +141,7 @@ class OpenAILLM(BaseLLM):
         """发送对话消息并获取完整响应。
 
         调用 OpenAI Chat Completions API（非流式），解析完整响应后
-        返回聚合的 ``LLMResponse``。
+        返回聚合的 ``LLMResponse``。支持指数退避重试（仅对可重试错误）。
 
         Parameters
         ----------
@@ -108,6 +163,8 @@ class OpenAILLM(BaseLLM):
             API 通信失败、鉴权失败或触发限流时抛出。
         """
         # 构建 API 请求参数
+        # 先按 context window 截断历史消息
+        messages = self._maybe_truncate_messages(messages)
         params: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -120,17 +177,25 @@ class OpenAILLM(BaseLLM):
         # kwargs 可覆盖已设置的参数（允许调用方自定义 tool_choice 等）
         params.update(kwargs)
 
+        async def _do_call() -> Any:
+            try:
+                return await self.client.chat.completions.create(**params)
+            except Exception as e:
+                raise self._convert_exception(e, "chat") from e
+
         try:
-            response = await self.client.chat.completions.create(**params)
-        except Exception as e:
-            logger.error(
-                "OpenAI chat API call failed: %s",
-                str(e),
-                extra={"model": self.model},
+            response = await with_retry(
+                _do_call,
+                max_retries=self._max_retries,
+                operation_name="OpenAI chat",
             )
-            raise LLMError(
-                f"OpenAI chat API call failed: {e}"
-            ) from e
+        except LLMError:
+            logger.error(
+                "OpenAI chat API call failed",
+                extra={"model": self.model},
+                exc_info=True,
+            )
+            raise
 
         choice = response.choices[0]
 
@@ -206,6 +271,7 @@ class OpenAILLM(BaseLLM):
             API 通信失败、鉴权失败或触发限流时抛出。
         """
         # 构建 API 请求参数（stream=True 启用流式模式）
+        messages = self._maybe_truncate_messages(messages)
         params: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -219,17 +285,25 @@ class OpenAILLM(BaseLLM):
         # kwargs 可覆盖已设置的参数
         params.update(kwargs)
 
+        async def _open_stream() -> Any:
+            try:
+                return await self.client.chat.completions.create(**params)
+            except Exception as e:
+                raise self._convert_exception(e, "stream") from e
+
         try:
-            stream = await self.client.chat.completions.create(**params)
-        except Exception as e:
-            logger.error(
-                "OpenAI stream API call failed: %s",
-                str(e),
-                extra={"model": self.model},
+            stream = await with_retry(
+                _open_stream,
+                max_retries=self._max_retries,
+                operation_name="OpenAI stream",
             )
-            raise LLMError(
-                f"OpenAI stream API call failed: {e}"
-            ) from e
+        except LLMError:
+            logger.error(
+                "OpenAI stream API call failed",
+                extra={"model": self.model},
+                exc_info=True,
+            )
+            raise
 
         # 维护待聚合的 tool_call 状态：key = tool_call.index
         pending_tool_calls: dict[int, dict[str, str]] = {}

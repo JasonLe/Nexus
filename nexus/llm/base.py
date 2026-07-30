@@ -148,11 +148,38 @@ class BaseLLM(ABC):
     - 若 provider 不支持 tool calling，应忽略 ``tools`` 参数并在响应中返回
       ``tool_calls=[]``。
 
+    Context Window 防护
+    --------------------
+    - ``context_window_tokens`` 属性定义模型上下文窗口大小（token 数）。
+    - 设为 0 表示不启用自动截断。
+    - 子类应在构造函数中设置此值（从配置或模型默认值读取）。
+    - ``_maybe_truncate_messages`` 在发送前自动截断超长历史。
+
     实现提示
     --------
     - ``chat()`` 可以先调用 ``stream_chat()`` 然后聚合所有 chunk 来简化实现。
     - ``UsageStats`` 应在 ``chat()`` 中由 provider 返回的 token 信息构造。
     """
+
+    def __init__(self) -> None:
+        self.context_window_tokens: int = 0  # 0 = 不启用自动截断
+
+    def _maybe_truncate_messages(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """若 context_window_tokens > 0 且消息超长，自动截断。
+
+        保留 system 消息和最近若干轮对话，删除最早的历史。
+        """
+        if self.context_window_tokens <= 0:
+            return messages
+        # 为输出预留 1/4 空间
+        budget = int(self.context_window_tokens * 0.75)
+        from nexus.llm.token_counter import truncate_messages_to_fit
+
+        return truncate_messages_to_fit(
+            messages, max_tokens=budget, model=self.model
+        )
 
     @abstractmethod
     async def chat(

@@ -87,10 +87,16 @@ def _create_llm(config: NexusConfig) -> BaseLLM:
     """根据 config 创建对应的 LLM 实例。
 
     Provider 工厂模式——根据 config.default_provider 动态选择，
-    传入 config.provider_config 中的 api_key、model、base_url、max_tokens。
+    传入 config.provider_config 中的 api_key、model、base_url、
+    context_window_tokens、timeout、max_retries。
     """
     provider = config.default_provider.lower()
     pc = config.provider_config
+
+    # 公共参数：超时、重试、context window
+    common_kwargs = {
+        "context_window_tokens": pc.context_window_tokens,
+    }
 
     if provider == "minimax":
         from nexus.llm.providers.minimax import MiniMaxAnthropicLLM
@@ -98,6 +104,7 @@ def _create_llm(config: NexusConfig) -> BaseLLM:
             api_key=pc.api_key,
             model=pc.model or "MiniMax-Text-01",
             base_url=pc.base_url or "https://api.minimaxi.com/anthropic",
+            **common_kwargs,
         )
     elif provider == "anthropic":
         from nexus.llm.providers.anthropic import AnthropicLLM
@@ -105,12 +112,14 @@ def _create_llm(config: NexusConfig) -> BaseLLM:
             api_key=pc.api_key,
             model=pc.model or "claude-sonnet-4-20250514",
             **({"base_url": pc.base_url} if pc.base_url else {}),
+            **common_kwargs,
         )
     else:
         return OpenAILLM(
             api_key=pc.api_key,
             base_url=pc.base_url,
             model=pc.model or "gpt-4o-mini",
+            **common_kwargs,
         )
 
 

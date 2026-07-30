@@ -234,6 +234,15 @@ class BaseTool(ABC):
             },
         }
 
+    @property
+    def timeout(self) -> float | None:
+        """工具执行超时（秒）。
+
+        返回 ``None`` 表示使用 ToolExecutor 的默认超时。
+        工具子类可覆写此属性自定义超时（如长时间运行的网络请求可设为 120s）。
+        """
+        return None
+
     async def setup(self) -> None:
         """可选：工具初始化逻辑（如建立连接、预热缓存）。
 

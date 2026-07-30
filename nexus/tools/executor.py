@@ -4,7 +4,7 @@
 --------
 在 BaseTool 和 Runtime 之间引入一个执行层，统一调度模型：
 
-    **校验 → 执行 → 包装 → 记录**
+    **校验 → 执行（含超时） → 包装 → 记录**
 
 为什么要独立一个 Executor 层：
 
@@ -14,8 +14,9 @@
    （ToolNotFoundError）和执行异常，全部包装为 ToolResult，上报层无需区分异常类型。
 3. **调用记录与可观测性** —— 每次调用自动记录日志（工具名、call_id、耗时、
    success/error），未来可回写到 AgentState 用于调试和审计。
-4. **扩展点** —— 未来可在此层加入调用限流（rate limit）、超时控制（asyncio.timeout）、
-   重试策略、参数预处理等，工具开发者无需感知。
+4. **超时控制** —— 通过 ``asyncio.wait_for`` 包装工具执行，防止卡死工具阻塞整个 Agent。
+   超时阈值优先级：tool.timeout > executor.default_timeout。
+5. **扩展点** —— 未来可在此层加入调用限流（rate limit）、重试策略、参数预处理等。
 
 调度模型
 --------
@@ -27,16 +28,17 @@
     1. 从 Registry 查找工具                 → ToolNotFoundError
     2. 校验参数（required / type）          → ToolValidationError
     3. setup()（若存在）                    → ToolError
-    4. 调用 tool.execute(args) + 计时       → 任意异常
+    4. 调用 tool.execute(args) + 计时 + 超时 → 任意异常 / TimeoutError
     5. 包装 ToolResult + 记录日志
     6. teardown()（若存在）                 → 记录警告（不阻塞结果）
 
 其中步骤 1-3 的异常被捕获并转换为 ``ToolResult(success=False, error=...)``，
-步骤 4 的工具自身异常同样被捕获转换。步骤 5 永远返回 ToolResult。
+步骤 4 的工具自身异常（含超时）同样被捕获转换。步骤 5 永远返回 ToolResult。
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -53,6 +55,9 @@ if TYPE_CHECKING:
     from nexus.tools.registry import ToolRegistry
 
 logger = get_logger(__name__)
+
+# 默认工具执行超时（秒）。工具可通过 timeout 属性覆写。
+DEFAULT_TOOL_TIMEOUT = 30.0
 
 # JSON Schema type 到 Python type 的映射，用于基本参数校验。
 _SCHEMA_TYPE_MAP: dict[str, type | tuple] = {
@@ -78,6 +83,9 @@ class ToolExecutor:
     ----------
     registry : ToolRegistry
         已注册工具的注册中心。
+    default_timeout : float
+        默认工具执行超时（秒）。工具可通过 ``timeout`` 属性覆写。
+        设为 ``None`` 表示不强制超时（不推荐生产使用）。
 
     使用示例
     --------
@@ -87,7 +95,7 @@ class ToolExecutor:
     >>>
     >>> registry = ToolRegistry()
     >>> registry.register(my_tool)
-    >>> executor = ToolExecutor(registry)
+    >>> executor = ToolExecutor(registry, default_timeout=30.0)
     >>> result = await executor.execute(
     ...     tool_name="my_tool",
     ...     tool_call_id="call_abc123",
@@ -97,8 +105,13 @@ class ToolExecutor:
     ...     print(result.data)
     """
 
-    def __init__(self, registry: ToolRegistry) -> None:
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        default_timeout: float | None = DEFAULT_TOOL_TIMEOUT,
+    ) -> None:
         self.registry: ToolRegistry = registry
+        self.default_timeout: float | None = default_timeout
 
     def _validate_args(self, tool: BaseTool, args: dict[str, Any]) -> None:
         """按工具 schema 校验参数。
@@ -254,9 +267,30 @@ class ToolExecutor:
                 duration_ms=elapsed,
             )
 
-        # 4. 执行工具
+        # 4. 执行工具（含超时控制）
+        # 超时优先级：tool.timeout（非 None） > executor.default_timeout
+        tool_timeout = getattr(tool, "timeout", None)
+        effective_timeout = tool_timeout if tool_timeout is not None else self.default_timeout
+
         try:
-            result: ToolResult = await tool.execute(arguments)
+            if effective_timeout is not None:
+                result = await asyncio.wait_for(
+                    tool.execute(arguments), timeout=effective_timeout
+                )
+            else:
+                result = await tool.execute(arguments)
+        except asyncio.TimeoutError:
+            elapsed = (time.perf_counter() - t_start) * 1000
+            logger.error(
+                "Tool execution timed out after %.1fs",
+                effective_timeout,
+                extra={"tool_name": tool_name, "tool_call_id": tool_call_id},
+            )
+            return ToolResult.fail(
+                error=f"Tool '{tool_name}' timed out after {effective_timeout}s",
+                tool_name=tool_name,
+                duration_ms=elapsed,
+            )
         except Exception as e:
             elapsed = (time.perf_counter() - t_start) * 1000
             logger.error(

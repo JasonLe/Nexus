@@ -17,10 +17,10 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
-[project.scripts]
-nexus = "nexus.cli.main:main"
-
 [project.optional-dependencies]
+tokenizer = [
+    "tiktoken>=0.7.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
@@ -31,6 +31,9 @@ cli = [
     "rich>=13.0.0",
     "prompt-toolkit>=3.0.0",
 ]
+
+[project.scripts]
+nexus = "nexus.cli.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["nexus"]
