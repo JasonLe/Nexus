@@ -10,18 +10,19 @@
 
   providers:                       # LLM Provider 配置
     openai:
-      api_key: ${OPENAI_API_KEY}   # 环境变量引用
+      api_key: sk-xxx              # 明文 API Key（save_config 写入时自动设为 0600 权限）
+      # 也可使用环境变量引用: api_key: ${OPENAI_API_KEY}
       model: gpt-4o-mini
       max_tokens: 4096
       context_window_tokens: 128000
       base_url: null
     anthropic:
-      api_key: ${ANTHROPIC_API_KEY}
+      api_key: sk-ant-xxx
       model: claude-sonnet-4-20250514
       max_tokens: 4096
       context_window_tokens: 200000
     minimax:
-      api_key: ${MINIMAX_API_KEY}
+      api_key: sk-minimax-xxx
       model: MiniMax-Text-01
       max_tokens: 4096
       context_window_tokens: 245760
@@ -40,7 +41,7 @@
       - list_dir
       - search_content
 
-环境变量引用:
+环境变量引用（向后兼容）:
   ${VAR}        - 替换为环境变量值
   ${VAR:-def}   - 有默认值的替换
 """
@@ -263,6 +264,24 @@ def _parse_providers(raw: dict[str, Any]) -> dict[str, ProviderConfig]:
     return result
 
 
+def _find_project_config(start_dir: str, filename: str) -> str | None:
+    """从 start_dir 向上查找配置文件，遇到 .git 边界停止。
+
+    查找顺序：start_dir → parent → ... 直至遇到目标文件、.git 目录（项目根
+    边界）或文件系统根。这样无论 debug 时 cwd 落在项目哪个子目录，都能读到
+    项目根的 nexus.yaml。找到返回绝对路径，找不到返回 None。
+    """
+    current = Path(start_dir).resolve()
+    for parent in [current] + list(current.parents):
+        candidate = parent / filename
+        if candidate.is_file():
+            return str(candidate)
+        # 遇到 .git 视为项目根边界：根目录都没有目标文件则停止向上查找
+        if (parent / ".git").exists():
+            return None
+    return None
+
+
 def _merge_dict_deep(base: dict, override: dict) -> dict:
     """深度合并两个字典，override 的值覆盖 base。"""
     result = dict(base)
@@ -283,7 +302,8 @@ def load_config(
     合并顺序（后加载覆盖前加载）：
     1. 代码默认值
     2. 用户级配置 ~/.nexus/nexus.yaml（向后兼容 ~/.nexus/config.json）
-    3. 项目级配置 <work_dir>/nexus.yaml（向后兼容 .nexus.json）
+    3. 项目级配置 —— 从 work_dir 向上查找 nexus.yaml 直到 .git 边界
+       （向后兼容 .nexus.json），让 debug 时 cwd 在子目录也能读到项目根配置
     4. 环境变量（NEXUS_MODEL / NEXUS_API_KEY / NEXUS_BASE_URL / NEXUS_PROVIDER 等）
     5. 命令行参数（cli_args），最高优先级
 
@@ -300,10 +320,15 @@ def load_config(
     # 向后兼容旧的 JSON 格式
     _apply_json_config(config, Path.home() / ".nexus" / "config.json")
 
-    # 3. 项目级配置
+    # 3. 项目级配置 —— 从 work_dir 向上查找直到 .git 边界
     if work_dir:
-        _apply_file_config(config, Path(work_dir) / "nexus.yaml")
-        _apply_json_config(config, Path(work_dir) / ".nexus.json")
+        yaml_path = _find_project_config(work_dir, "nexus.yaml")
+        if yaml_path:
+            _apply_file_config(config, Path(yaml_path))
+            logger.debug("Project config found: %s", yaml_path)
+        json_path = _find_project_config(work_dir, ".nexus.json")
+        if json_path:
+            _apply_json_config(config, Path(json_path))
 
     # 4. 环境变量
     _apply_env_overrides(config)
@@ -327,25 +352,37 @@ def _apply_file_config(config: NexusConfig, path: Path) -> None:
     if not raw:
         return
 
-    # providers
+    # providers —— 内联解析以便判断 YAML 中是否显式声明某字段
     if "providers" in raw and isinstance(raw["providers"], dict):
-        parsed = _parse_providers(raw["providers"])
-        for name, pc in parsed.items():
+        for name, prov_raw in raw["providers"].items():
+            if not isinstance(prov_raw, dict):
+                continue
+            # 解析环境变量引用（向后兼容 ${VAR} 语法）
+            api_key_raw = prov_raw.get("api_key")
+            api_key = _resolve_env_refs(api_key_raw) if isinstance(api_key_raw, str) else api_key_raw
+
             if name in config.providers:
-                # 合并：只覆盖非空字段
                 existing = config.providers[name]
-                if pc.api_key is not None:
-                    existing.api_key = pc.api_key
-                if pc.model:
-                    existing.model = pc.model
-                if pc.max_tokens != 4096 or "max_tokens" in raw.get("providers", {}).get(name, {}):
-                    existing.max_tokens = pc.max_tokens
-                if pc.context_window_tokens:
-                    existing.context_window_tokens = pc.context_window_tokens
-                if pc.base_url is not None:
-                    existing.base_url = pc.base_url
+                # 仅覆盖 YAML 中显式声明的字段
+                if api_key is not None:
+                    existing.api_key = api_key
+                if "model" in prov_raw:
+                    existing.model = str(prov_raw["model"])
+                if "max_tokens" in prov_raw:
+                    existing.max_tokens = int(prov_raw["max_tokens"])
+                if "context_window_tokens" in prov_raw:
+                    existing.context_window_tokens = int(prov_raw["context_window_tokens"])
+                if "base_url" in prov_raw and prov_raw["base_url"] is not None:
+                    existing.base_url = prov_raw["base_url"]
             else:
-                config.providers[name] = pc
+                # 新增 provider，走完整解析
+                config.providers[name] = ProviderConfig(
+                    api_key=api_key,
+                    model=str(prov_raw.get("model", "")),
+                    max_tokens=int(prov_raw.get("max_tokens", 4096)),
+                    context_window_tokens=int(prov_raw.get("context_window_tokens", 0)),
+                    base_url=prov_raw.get("base_url"),
+                )
 
     # default_provider
     if "default_provider" in raw:
@@ -494,11 +531,14 @@ def save_config(config: NexusConfig, path: str | None = None) -> str:
 
     data: dict[str, Any] = {}
 
-    # providers（跳过 api_key）
+    # providers（保留 api_key —— 用户手动管理的配置需要可持久化；
+    # 文件权限由本函数末尾统一设为 0o600 以降低明文 key 的风险）
     providers_data: dict[str, Any] = {}
     for name, pc in config.providers.items():
         pd: dict[str, Any] = {"model": pc.model}
-        if pc.max_tokens and pc.max_tokens != 4096:
+        if pc.api_key:
+            pd["api_key"] = pc.api_key
+        if pc.max_tokens:
             pd["max_tokens"] = pc.max_tokens
         if pc.context_window_tokens:
             pd["context_window_tokens"] = pc.context_window_tokens
@@ -528,5 +568,65 @@ def save_config(config: NexusConfig, path: str | None = None) -> str:
             sort_keys=False,
         )
 
-    logger.info("Config saved to %s", path)
+    # 配置文件可能包含明文 api_key，限制为属主可读写（POSIX 生效，Windows 上为 no-op）
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        logger.debug("Failed to chmod 600 on %s", path)
+
+    has_api_key = any(pc.api_key for pc in config.providers.values())
+    if has_api_key:
+        logger.debug("Config saved with api_key to %s (file permission 0600)", path)
+    else:
+        logger.info("Config saved to %s", path)
     return path
+
+
+# ------------------------------------------------------------------
+# 模板生成
+# ------------------------------------------------------------------
+
+def generate_config_template() -> str:
+    """生成带注释的完整 nexus.yaml 模板字符串。
+
+    与 save_config() 的区别：模板包含所有字段（含 api_key 占位符、
+    max_tokens 默认值、context_window_tokens 等），并带行内注释说明，
+    供 --init-config 命令写入磁盘供用户参考填写。
+    """
+    return """\
+# Nexus CLI 配置文件
+# 优先级：命令行参数 > 环境变量 > 项目级 nexus.yaml > 用户级 ~/.nexus/nexus.yaml > 默认值
+
+providers:
+  openai:
+    api_key: null              # 填入你的 OpenAI API Key，例如 sk-xxx
+    model: gpt-4o-mini
+    max_tokens: 4096
+    context_window_tokens: 128000
+    base_url: null             # 自定义 API 端点，留空使用官方端点
+  anthropic:
+    api_key: null              # 填入你的 Anthropic API Key
+    model: claude-sonnet-4-20250514
+    max_tokens: 4096
+    context_window_tokens: 200000
+    base_url: null
+  minimax:
+    api_key: null              # 填入你的 MiniMax API Key
+    model: MiniMax-Text-01
+    max_tokens: 4096
+    context_window_tokens: 245760
+    base_url: https://api.minimaxi.com/anthropic
+
+default_provider: openai       # 默认使用的 provider
+
+agent:
+  system_prompt: "You are a helpful coding assistant."
+  max_steps: 30
+
+tools:
+  enabled:
+    - read_file
+    - write_file
+    - list_dir
+    - search_content
+"""

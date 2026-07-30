@@ -607,13 +607,17 @@ nexus --list-sessions
 |------|------|--------|
 | `prompt` | 直接执行的任务描述（位置参数） | - |
 | `--model` | LLM 模型名称 | `gpt-4o-mini` |
+| `--provider` | LLM Provider (openai\|anthropic\|minimax) | `openai` |
 | `--api-key` | API Key | 环境变量 `NEXUS_API_KEY` |
 | `--base-url` | API 自定义端点 | - |
 | `--system-prompt` | 系统提示词 | 内置编程助理提示 |
 | `--max-steps` | 最大执行步数 | `30` |
+| `--max-tokens` | 单次 LLM 调用最大输出 token 数 | `4096` |
 | `--work-dir` | 工作目录 | 当前目录 |
 | `--continue` | 恢复最近会话 | - |
 | `--list-sessions` | 列出历史会话 | - |
+| `--init-config` | 在当前目录生成 `nexus.yaml` 模板 | - |
+| `--save-config` | 退出前将当前配置写入 `~/.nexus/nexus.yaml` | - |
 | `-v` / `--verbose` | 显示详细日志 | - |
 | `--debug` | 显示调试日志 | - |
 
@@ -631,25 +635,61 @@ nexus --list-sessions
 
 ### 配置管理
 
-支持三级配置（优先级从高到低）：
+支持五级配置（优先级从高到低）：
 
-1. **命令行参数**：`--model gpt-4o --api-key sk-xxx`
-2. **环境变量**：`NEXUS_MODEL`、`NEXUS_API_KEY`、`NEXUS_BASE_URL`、`NEXUS_MAX_STEPS`
-3. **配置文件**：
-   - 项目级：`.nexus.json`（当前目录）
-   - 用户级：`~/.nexus/config.json`
+1. **命令行参数**：`--model gpt-4o --api-key sk-xxx --provider openai`
+2. **环境变量**：`NEXUS_MODEL`、`NEXUS_API_KEY`、`NEXUS_BASE_URL`、`NEXUS_PROVIDER`、`NEXUS_MAX_STEPS`、`NEXUS_MAX_TOKENS`
+3. **项目级配置文件**：`<work_dir>/nexus.yaml`（向后兼容 `.nexus.json`）
+4. **用户级配置文件**：`~/.nexus/nexus.yaml`（向后兼容 `~/.nexus/config.json`）
+5. **内置默认值**：openai/anthropic/minimax 三个 provider 的默认模型与参数
 
-配置文件示例 (`~/.nexus/config.json`)：
+#### 生成配置模板
 
-```json
-{
-  "model": "gpt-4o-mini",
-  "provider": "openai",
-  "system_prompt": "You are a helpful coding assistant.",
-  "max_steps": 30,
-  "tools": ["read_file", "write_file", "list_dir"]
-}
+```bash
+# 在当前目录生成 nexus.yaml 模板（含注释和所有字段示例）
+nexus --init-config
 ```
+
+模板生成后，手动填入各 provider 的 `api_key` 字段即可。出于安全考虑，`save_config` 写入的文件会自动设置 `0600` 权限。
+
+#### 保存当前运行配置
+
+```bash
+# 退出前将当前生效配置写入 ~/.nexus/nexus.yaml
+nexus --save-config
+```
+
+配置文件示例 (`nexus.yaml`)：
+
+```yaml
+providers:
+  openai:
+    api_key: sk-xxx
+    model: gpt-4o-mini
+    max_tokens: 4096
+    context_window_tokens: 128000
+    base_url: null
+  anthropic:
+    api_key: sk-ant-xxx
+    model: claude-sonnet-4-20250514
+    max_tokens: 4096
+    context_window_tokens: 200000
+
+default_provider: openai
+
+agent:
+  system_prompt: "You are a helpful coding assistant."
+  max_steps: 30
+
+tools:
+  enabled:
+    - read_file
+    - write_file
+    - list_dir
+    - search_content
+```
+
+> 也支持 `${ENV_VAR}` 和 `${ENV_VAR:-default}` 环境变量引用语法（向后兼容）。
 
 ### CLI 内置工具
 

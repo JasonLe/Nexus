@@ -277,18 +277,17 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # --init-config 生成模板后退出
+    # --init-config 生成完整带注释的模板后退出
     if args.init_config:
-        config = NexusConfig(providers={})  # 用默认值生成完整模板
-        # 重建带默认值的 config
-        from nexus.cli.config import _default_providers
-        config = NexusConfig(providers=_default_providers())
+        from nexus.cli.config import generate_config_template
         path = str(Path(os.getcwd()) / "nexus.yaml")
         if os.path.exists(path):
             print(f"File already exists: {path}")
             return
-        save_config(config, path)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(generate_config_template())
         print(f"Config template created: {path}")
+        print("Fill in your API keys, then run `nexus` to start.")
         return
 
     # 日志配置

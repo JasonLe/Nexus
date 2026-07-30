@@ -65,21 +65,31 @@ nexus/
 
 ### 配置管理
 
-支持三级配置优先级（从高到低）：
-1. **命令行参数**：`--model gpt-4o --api-key sk-xxx`
-2. **环境变量**：`NEXUS_MODEL`、`NEXUS_API_KEY`、`NEXUS_BASE_URL`
-3. **配置文件**：`~/.nexus/config.json` 或项目级 `.nexus.json`
+支持五级配置优先级（从高到低）：
+1. **命令行参数**：`--model gpt-4o --api-key sk-xxx --provider openai`
+2. **环境变量**：`NEXUS_MODEL`、`NEXUS_API_KEY`、`NEXUS_BASE_URL`、`NEXUS_PROVIDER`、`NEXUS_MAX_STEPS`、`NEXUS_MAX_TOKENS`
+3. **项目级配置文件**：`<work_dir>/nexus.yaml`（向后兼容 `.nexus.json`）
+4. **用户级配置文件**：`~/.nexus/nexus.yaml`（向后兼容 `~/.nexus/config.json`）
+5. **内置默认值**：openai/anthropic/minimax 三个 provider 的默认模型与参数
 
-配置文件格式：
-```json
-{
-  "model": "gpt-4o-mini",
-  "provider": "openai",
-  "base_url": null,
-  "system_prompt": "You are a helpful coding assistant.",
-  "max_steps": 30,
-  "tools": ["read_file", "write_file", "list_dir"]
-}
+配置文件格式（YAML）：
+```yaml
+providers:
+  openai:
+    api_key: sk-xxx
+    model: gpt-4o-mini
+    max_tokens: 4096
+    context_window_tokens: 128000
+    base_url: null
+default_provider: openai
+agent:
+  system_prompt: "You are a helpful coding assistant."
+  max_steps: 30
+tools:
+  enabled:
+    - read_file
+    - write_file
+    - list_dir
 ```
 
 ### 依赖新增

@@ -29,8 +29,10 @@ from nexus.cli.config import (
     ProviderConfig,
     ToolsConfig,
     _default_providers,
+    _find_project_config,
     _load_json_config,
     _load_yaml_config,
+    generate_config_template,
     load_config,
     save_config,
 )
@@ -353,6 +355,81 @@ class TestLoadConfig:
 
 
 # ---------------------------------------------------------------------------
+# 项目级配置向上查找测试（debug 时 cwd 在子目录也能读到项目根配置）
+# ---------------------------------------------------------------------------
+
+class TestFindProjectConfig:
+    """测试 _find_project_config 向上查找与 .git 边界。"""
+
+    def test_finds_in_current_dir(self, tmp_path):
+        """目标文件就在 start_dir 下。"""
+        (tmp_path / "nexus.yaml").write_text("default_provider: openai", encoding="utf-8")
+        result = _find_project_config(str(tmp_path), "nexus.yaml")
+        assert result == str(tmp_path / "nexus.yaml")
+
+    def test_finds_in_parent(self, tmp_path):
+        """start_dir 没有，父目录有 → 返回父目录路径。"""
+        (tmp_path / "nexus.yaml").write_text("default_provider: anthropic", encoding="utf-8")
+        subdir = tmp_path / "subdir"
+        subdir.mkdir()
+        result = _find_project_config(str(subdir), "nexus.yaml")
+        assert result == str(tmp_path / "nexus.yaml")
+
+    def test_finds_in_deep_subdir(self, tmp_path):
+        """深层子目录也能向上找到项目根的配置。"""
+        (tmp_path / "nexus.yaml").write_text("default_provider: minimax", encoding="utf-8")
+        deep = tmp_path / "a" / "b" / "c"
+        deep.mkdir(parents=True)
+        result = _find_project_config(str(deep), "nexus.yaml")
+        assert result == str(tmp_path / "nexus.yaml")
+
+    def test_stops_at_git_boundary(self, tmp_path):
+        """.git 边界外没有文件 → 返回 None（不越过项目根）。"""
+        # tmp_path 作为项目根，放 .git 标记但不放 nexus.yaml
+        (tmp_path / ".git").mkdir()
+        subdir = tmp_path / "subdir"
+        subdir.mkdir()
+        result = _find_project_config(str(subdir), "nexus.yaml")
+        assert result is None
+
+    def test_git_boundary_with_config(self, tmp_path):
+        """项目根有 .git 也有 nexus.yaml → 能找到。"""
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "nexus.yaml").write_text("default_provider: openai", encoding="utf-8")
+        subdir = tmp_path / "subdir"
+        subdir.mkdir()
+        result = _find_project_config(str(subdir), "nexus.yaml")
+        assert result == str(tmp_path / "nexus.yaml")
+
+    def test_not_found(self, tmp_path):
+        """整个目录链都没有目标文件 → 返回 None。"""
+        (tmp_path / ".git").mkdir()  # 项目根但无配置文件
+        result = _find_project_config(str(tmp_path), "nexus.yaml")
+        assert result is None
+
+    def test_load_config_finds_parent(self, tmp_path, monkeypatch):
+        """load_config 从子目录 work_dir 向上读到项目根的 nexus.yaml。"""
+        (tmp_path / "nexus.yaml").write_text(
+            yaml.dump({
+                "default_provider": "anthropic",
+                "agent": {"max_steps": 50},
+            }),
+            encoding="utf-8",
+        )
+        # 隔离 home 目录，避免 ~/.nexus 干扰
+        empty_home = tmp_path / "empty_home"
+        empty_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: empty_home)
+
+        subdir = tmp_path / "subdir"
+        subdir.mkdir()
+        # work_dir 是子目录，但配置在项目根
+        config = load_config(cli_args=None, work_dir=str(subdir))
+        assert config.default_provider == "anthropic"
+        assert config.max_steps == 50
+
+
+# ---------------------------------------------------------------------------
 # Provider 切换
 # ---------------------------------------------------------------------------
 
@@ -539,35 +616,39 @@ class TestToolsConfig:
 # ---------------------------------------------------------------------------
 
 class TestInitConfig:
-    """测试 --init-config 生成 YAML 模板。"""
+    """测试 --init-config 生成 YAML 模板（generate_config_template）。"""
 
     def test_init_config(self, tmp_path):
-        """生成 nexus.yaml 模板并验证内容。"""
-        config = NexusConfig(providers=_default_providers())
+        """generate_config_template 生成完整带注释的模板。"""
+        template = generate_config_template()
+
+        # 写入文件验证
         path = str(tmp_path / "nexus.yaml")
-        result = save_config(config, path)
-        assert result == path
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(template)
         assert os.path.isfile(path)
 
-        # 重新加载验证
+        # 重新加载验证内容
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
 
         assert "providers" in data
         assert "openai" in data["providers"]
         assert data["providers"]["openai"]["model"] == "gpt-4o-mini"
+        # 模板包含 api_key 占位符（null）
+        assert "api_key" in data["providers"]["openai"]
+        assert data["providers"]["openai"]["api_key"] is None
         assert data["default_provider"] == "openai"
         assert data["agent"]["max_steps"] == 30
         assert data["agent"]["system_prompt"] == "You are a helpful coding assistant."
 
     def test_init_config_in_subdir(self, tmp_path):
-        """在子目录中生成模板。"""
+        """模板可写入任意目录。"""
         subdir = tmp_path / "subdir"
         subdir.mkdir()
-        config = NexusConfig(providers=_default_providers())
-        path = str(subdir / "nexus.yaml")
-        save_config(config, path)
-        assert os.path.isfile(path)
+        path = subdir / "nexus.yaml"
+        path.write_text(generate_config_template(), encoding="utf-8")
+        assert path.is_file()
 
 
 # ---------------------------------------------------------------------------
@@ -581,6 +662,7 @@ class TestSaveConfig:
         """save_config 写入 YAML 文件并可回读。"""
         config = NexusConfig(providers=_default_providers())
         config.providers["openai"].model = "custom-model"
+        config.providers["openai"].api_key = "sk-test-123"
         config.agent.max_steps = 100
         config.tools.enabled = ["read_file", "search_content"]
 
@@ -589,14 +671,16 @@ class TestSaveConfig:
         assert saved_path == path
         assert os.path.isfile(path)
 
-        # 验证不包含 api_key（安全措施）
+        # api_key 现在被保留（用户手动管理的配置需要可持久化）
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
-        assert "api_key" not in content
+        assert "api_key" in content
+        assert "sk-test-123" in content
 
         # 重新加载验证
         data = _load_yaml_config(path)
         assert data["providers"]["openai"]["model"] == "custom-model"
+        assert data["providers"]["openai"]["api_key"] == "sk-test-123"
         assert data["agent"]["max_steps"] == 100
         assert data["tools"]["enabled"] == ["read_file", "search_content"]
 

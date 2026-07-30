@@ -17,7 +17,8 @@ Anthropic ↔ Nexus 格式映射
 
 Messages 转换（Nexus → Anthropic）:
   system role 消息 → Anthropic 的 system 参数
-  其余消息保持 role/content 结构直接传入
+  assistant tool_calls → content 中的 tool_use block
+  role="tool" 消息 → role="user" + tool_result block（连续 tool result 合并）
 
 响应转换（Anthropic → Nexus）:
   Anthropic text block      → LLMResponse.content
@@ -31,6 +32,7 @@ Messages 转换（Nexus → Anthropic）:
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, AsyncIterator
 
@@ -254,6 +256,13 @@ class AnthropicLLM(BaseLLM):
         Anthropic API 要求 system prompt 作为独立参数传入，
         而非放在 messages 中。此方法完成提取和转换。
 
+        Runtime 内部使用 OpenAI 格式存储消息（tool_calls 作为顶层字段、
+        tool result 用 role="tool"），但 Anthropic API 要求：
+        - assistant 的 tool_calls → content 中的 tool_use block
+        - tool result (role="tool") → role="user" + tool_result block
+
+        本方法负责上述转换，并合并连续的 tool result 到同一个 user 消息。
+
         Returns
         -------
         tuple[str | None, list[dict]]
@@ -263,15 +272,86 @@ class AnthropicLLM(BaseLLM):
         anthropic_messages: list[dict[str, Any]] = []
 
         for msg in messages:
-            if msg.get("role") == "system":
+            role = msg.get("role", "user")
+
+            # system 消息 → 提取到 system_prompt 参数
+            if role == "system":
                 content = msg.get("content", "")
                 if isinstance(content, str) and content.strip():
                     system_parts.append(content)
-            else:
-                anthropic_messages.append({
-                    "role": msg.get("role", "user"),
-                    "content": msg.get("content", ""),
-                })
+                continue
+
+            # tool result (OpenAI role="tool") → Anthropic role="user" + tool_result block
+            if role == "tool":
+                tool_call_id = msg.get("tool_call_id", "")
+                content = msg.get("content", "")
+                tool_result_block = {
+                    "type": "tool_result",
+                    "tool_use_id": tool_call_id,
+                    "content": str(content) if content is not None else "",
+                }
+                # 合并到上一个 user 消息（若它也是 tool_result 合并消息）
+                if (
+                    anthropic_messages
+                    and anthropic_messages[-1]["role"] == "user"
+                    and isinstance(anthropic_messages[-1]["content"], list)
+                    and anthropic_messages[-1]["content"]
+                    and anthropic_messages[-1]["content"][0].get("type") == "tool_result"
+                ):
+                    anthropic_messages[-1]["content"].append(tool_result_block)
+                else:
+                    anthropic_messages.append({
+                        "role": "user",
+                        "content": [tool_result_block],
+                    })
+                continue
+
+            # assistant 消息 —— 转换 tool_calls（OpenAI）→ tool_use block（Anthropic）
+            if role == "assistant":
+                content_blocks: list[dict[str, Any]] = []
+
+                # 文本内容
+                text_content = msg.get("content")
+                if text_content:
+                    content_blocks.append({"type": "text", "text": text_content})
+
+                # tool_calls → tool_use blocks
+                tool_calls = msg.get("tool_calls")
+                if tool_calls:
+                    for tc in tool_calls:
+                        func = tc.get("function", {})
+                        args = func.get("arguments", "{}")
+                        # arguments 可能是 JSON 字符串或 dict
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args) if args.strip() else {}
+                            except json.JSONDecodeError:
+                                args = {}
+                        content_blocks.append({
+                            "type": "tool_use",
+                            "id": tc.get("id", ""),
+                            "name": func.get("name", ""),
+                            "input": args,
+                        })
+
+                if content_blocks:
+                    anthropic_messages.append({
+                        "role": "assistant",
+                        "content": content_blocks,
+                    })
+                else:
+                    # 空 assistant 消息兜底
+                    anthropic_messages.append({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": ""}],
+                    })
+                continue
+
+            # 普通 user / 其他消息 —— 保持 role + content
+            anthropic_messages.append({
+                "role": role,
+                "content": msg.get("content", ""),
+            })
 
         system_prompt = "\n\n".join(system_parts) if system_parts else None
 
