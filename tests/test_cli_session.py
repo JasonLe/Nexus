@@ -12,6 +12,7 @@
 
 import json
 import time
+from pathlib import Path
 
 import pytest
 
@@ -166,6 +167,172 @@ class TestDeleteSession:
         """删除不存在的会话应返回 False。"""
         sm = SessionManager(sessions_dir=str(tmp_path))
         assert sm.delete("nonexistent") is False
+
+
+# ---------------------------------------------------------------------------
+# save(session_id=...) / save(log_file=...) 测试
+# ---------------------------------------------------------------------------
+
+
+class TestSaveWithSessionId:
+    """测试显式 session_id 与 log_file 参数。"""
+
+    def test_save_with_explicit_session_id_overwrites(self, tmp_path):
+        """同一 session_id 两次 save 后只存在一个 JSON 文件。"""
+        sm = SessionManager(sessions_dir=str(tmp_path))
+        fixed_id = "abc12345"
+
+        # 第一次保存
+        sm.save(
+            _make_state(task="first", messages=[{"role": "user", "content": "first"}]),
+            session_id=fixed_id,
+        )
+        # 第二次保存（同 id 应覆盖）
+        sm.save(
+            _make_state(task="second", messages=[{"role": "user", "content": "second"}]),
+            session_id=fixed_id,
+        )
+
+        # sessions_dir 下应只有一个 <fixed_id>.json
+        json_files = list(tmp_path.glob("*.json"))
+        assert len(json_files) == 1
+        assert json_files[0].stem == fixed_id
+
+        # 内容应为第二次保存的
+        loaded = sm.load(fixed_id)
+        assert loaded is not None
+        assert loaded.task == "second"
+
+    def test_save_with_log_file_metadata(self, tmp_path):
+        """传入 log_file 参数后，JSON metadata.log_file 字段应正确。"""
+        sm = SessionManager(sessions_dir=str(tmp_path))
+        log_path = "/tmp/test_log_dir/abc12345.log"
+
+        session_id = sm.save(
+            _make_state(task="with log"),
+            log_file=log_path,
+        )
+
+        # 直接读取文件验证 metadata
+        filepath = tmp_path / f"{session_id}.json"
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        assert data["metadata"]["log_file"] == log_path
+
+    def test_save_without_log_file_has_no_metadata_key(self, tmp_path):
+        """不传 log_file 时，metadata 不应包含 log_file 键。"""
+        sm = SessionManager(sessions_dir=str(tmp_path))
+        session_id = sm.save(_make_state(task="no log"))
+
+        filepath = tmp_path / f"{session_id}.json"
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        assert "log_file" not in data["metadata"]
+
+
+# ---------------------------------------------------------------------------
+# delete(delete_logs=...) 同步删除日志测试
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteWithLogs:
+    """测试 delete(delete_logs=True/False) 的日志同步清理。"""
+
+    def test_delete_removes_log_file_from_metadata(self, tmp_path, monkeypatch):
+        """delete 应根据 metadata.log_file 删除关联日志文件。"""
+        # 将 ~ 指向 tmp_path 以隔离测试
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        sm = SessionManager(sessions_dir=str(tmp_path / "sessions"))
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "deadbeef.log"
+        log_file.write_text("some log content")
+
+        session_id = sm.save(
+            _make_state(task="with log"),
+            log_file=str(log_file),
+        )
+
+        # 验证日志文件存在
+        assert log_file.exists()
+
+        # 删除会话应同步删除日志
+        assert sm.delete(session_id, delete_logs=True) is True
+        assert not log_file.exists()
+
+    def test_delete_with_path_fallback(self, tmp_path, monkeypatch):
+        """metadata 缺失 log_file 时，应通过拼路径兜底删除日志。"""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        sm = SessionManager(sessions_dir=str(tmp_path / "sessions"))
+        # 不传 log_file 参数保存会话（metadata 中无 log_file）
+        session_id = sm.save(_make_state(task="no log metadata"))
+
+        # 在 ~/.nexus/logs/<session_id>.log 手动创建日志文件
+        log_dir = tmp_path / ".nexus" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        fallback_log = log_dir / f"{session_id}.log"
+        fallback_log.write_text("orphan log")
+
+        assert fallback_log.exists()
+
+        # 删除应通过兜底路径清理日志
+        assert sm.delete(session_id, delete_logs=True) is True
+        assert not fallback_log.exists()
+
+    def test_delete_keep_logs(self, tmp_path, monkeypatch):
+        """delete(delete_logs=False) 应只删 JSON，保留日志。"""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        sm = SessionManager(sessions_dir=str(tmp_path / "sessions"))
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "keepme.log"
+
+        session_id = sm.save(
+            _make_state(task="keep log"),
+            log_file=str(log_file),
+        )
+        log_file.write_text("persist this")
+
+        assert sm.delete(session_id, delete_logs=False) is True
+        # JSON 已删
+        assert sm.load(session_id) is None
+        # 日志保留
+        assert log_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# list_sessions 含 log_file 字段测试
+# ---------------------------------------------------------------------------
+
+
+class TestListSessionsWithLogFile:
+    """测试 list_sessions 返回项含 log_file 字段。"""
+
+    def test_list_sessions_includes_log_file(self, tmp_path):
+        """list_sessions 返回项应含 log_file 字段（来自 metadata）。"""
+        sm = SessionManager(sessions_dir=str(tmp_path))
+
+        # 带 log_file 的会话
+        sm.save(
+            _make_state(task="with log"),
+            log_file="/tmp/abc.log",
+            session_id="withlog01",
+        )
+        # 不带 log_file 的会话
+        sm.save(
+            _make_state(task="without log"),
+            session_id="nolog0001",
+        )
+
+        sessions = sm.list_sessions()
+        assert len(sessions) == 2
+
+        by_id = {s["id"]: s for s in sessions}
+        assert by_id["withlog01"]["log_file"] == "/tmp/abc.log"
+        assert by_id["nolog0001"]["log_file"] is None
 
 
 # ---------------------------------------------------------------------------

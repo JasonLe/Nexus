@@ -428,6 +428,36 @@ class DisplayManager:
             extra={"steps": steps, "total_tokens": total_tokens},
         )
 
+    def render_sessions_table(self, sessions: list[dict]) -> None:
+        """渲染历史会话列表为 Rich Table。
+
+        在 ``nexus sessions list`` 与 ``nexus --list-sessions`` 中复用，
+        将 SessionManager.list_sessions() 返回的会话列表渲染为
+        四列表格：ID / 创建时间 / 消息数 / 摘要。
+
+        Parameters
+        ----------
+        sessions : list[dict]
+            每项应含字段：id / timestamp / message_count / summary
+            （log_file 字段不在表格中展示，仅在 delete 操作时显示）
+        """
+        table = Table(title="Nexus Sessions", show_lines=False, border_style="cyan")
+        table.add_column("ID", style="bold cyan", width=10)
+        table.add_column("Created", style="dim", width=20)
+        table.add_column("Msgs", justify="right", width=6)
+        table.add_column("Summary", overflow="fold")
+
+        for s in sessions:
+            table.add_row(
+                s.get("id", ""),
+                s.get("timestamp", ""),
+                str(s.get("message_count", 0)),
+                s.get("summary") or "(empty)",
+            )
+
+        self.console.print(table)
+        logger.info("Sessions table rendered", extra={"count": len(sessions)})
+
     # ------------------------------------------------------------------
     # 信息输出
     # ------------------------------------------------------------------

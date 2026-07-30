@@ -18,7 +18,8 @@ import argparse
 import asyncio
 import logging
 import os
-from logging.handlers import RotatingFileHandler
+import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -38,8 +39,9 @@ logger = get_logger(__name__)
 def setup_logging(
     verbose: bool = False,
     debug: bool = False,
-    log_file: str | None = None,
-) -> None:
+    session_id: str | None = None,
+    log_dir: str | None = None,
+) -> str:
     """配置 CLI 日志（终端 + 文件持久化）。
 
     终端日志级别由 verbose/debug 控制：
@@ -47,8 +49,25 @@ def setup_logging(
     - verbose=True: INFO 级别
     - 默认: WARNING 级别
 
-    文件日志始终输出 DEBUG 级别，存储在 ~/.nexus/logs/nexus.log，
-    使用 RotatingFileHandler（10MB × 5 备份）防止磁盘膨胀。
+    文件日志始终输出 DEBUG 级别，按会话命名存储在
+    ``~/.nexus/logs/<session_id>.log``，与 ``~/.nexus/sessions/<session_id>.json``
+    一一对应，便于会话删除时同步清理日志。
+
+    Parameters
+    ----------
+    verbose : bool
+        终端显示 INFO 级别日志。
+    debug : bool
+        终端显示 DEBUG 级别日志（覆盖 verbose）。
+    session_id : str | None
+        会话 ID，用作日志文件名。None 时自动生成 8 位 uuid 前缀。
+    log_dir : str | None
+        日志根目录，None 时默认 ``~/.nexus/logs/``。
+
+    Returns
+    -------
+    str
+        实际写入的日志文件绝对路径，供调用方写入会话 metadata。
     """
     level = logging.DEBUG if debug else (logging.INFO if verbose else logging.WARNING)
 
@@ -62,14 +81,17 @@ def setup_logging(
     stream_handler.setLevel(level)
     nexus_logger.addHandler(stream_handler)
 
-    # 文件日志 —— 始终 DEBUG 级别
-    if log_file is None:
-        log_dir = Path.home() / ".nexus" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = str(log_dir / "nexus.log")
+    # 文件日志 —— 按会话命名，平铺存储在 ~/.nexus/logs/<session_id>.log
+    # 与 ~/.nexus/sessions/<session_id>.json 一一对应
+    resolved_session_id = session_id or str(uuid.uuid4())[:8]
+    log_root = Path(log_dir) if log_dir else (Path.home() / ".nexus" / "logs")
+    log_root.mkdir(parents=True, exist_ok=True)
+    log_file_path = log_root / f"{resolved_session_id}.log"
 
-    file_handler = RotatingFileHandler(
-        log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8",
+    # 单会话日志通常 < 1MB，使用普通 FileHandler 即可；
+    # 多会话隔离已通过分文件解决，无需 RotatingFileHandler
+    file_handler = logging.FileHandler(
+        log_file_path, encoding="utf-8",
     )
     file_handler.setFormatter(formatter)
     file_handler.setLevel(logging.DEBUG)
@@ -79,8 +101,9 @@ def setup_logging(
     logger.debug(
         "Logging configured: terminal_level=%s, file=%s",
         logging.getLevelName(level),
-        log_file,
+        log_file_path,
     )
+    return str(log_file_path)
 
 
 def _create_llm(config: NexusConfig) -> BaseLLM:
@@ -274,7 +297,12 @@ def _run_single(agent: Agent, config: NexusConfig, prompt: str) -> None:
     asyncio.run(_run())
 
 
-def _run_continue(agent: Agent, config: NexusConfig) -> None:
+def _run_continue(
+    agent: Agent,
+    config: NexusConfig,
+    run_id: str | None = None,
+    log_file: str | None = None,
+) -> None:
 
     async def _run() -> None:
         try:
@@ -298,7 +326,11 @@ def _run_continue(agent: Agent, config: NexusConfig) -> None:
             return
 
         display = DisplayManager()
-        repl = Repl(agent=agent, display=display, config=config)
+        # 新进程使用新 run_id（新日志文件），旧 session JSON 与旧日志保留不动
+        repl = Repl(
+            agent=agent, display=display, config=config,
+            run_id=run_id, log_file=log_file,
+        )
         await repl.restore_session(session)
         await repl.run()
 
@@ -306,6 +338,13 @@ def _run_continue(agent: Agent, config: NexusConfig) -> None:
 
 
 def main() -> None:
+    # 早期派发：nexus sessions <sub> [args]
+    # 与位置参数 prompt 不兼容（argparse subparsers 会把 "sessions" 当成 prompt），
+    # 因此在 argparse 解析前手动拦截
+    if len(sys.argv) > 1 and sys.argv[1] == "sessions":
+        _run_sessions_command(sys.argv[2:])
+        return
+
     parser = argparse.ArgumentParser(
         prog="nexus",
         description="Nexus CLI Agent - 命令行编程助理",
@@ -326,7 +365,7 @@ def main() -> None:
         help="恢复最近会话",
     )
     parser.add_argument(
-        "--list-sessions", action="store_true", help="列出历史会话",
+        "--list-sessions", action="store_true", help="列出历史会话（推荐使用 `nexus sessions list`）",
     )
     parser.add_argument(
         "--save-config", action="store_true",
@@ -354,23 +393,23 @@ def main() -> None:
         print("Fill in your API keys, then run `nexus` to start.")
         return
 
-    # 日志配置
-    setup_logging(verbose=args.verbose, debug=args.debug)
+    # 日志配置 —— 生成 run_id 用于「日志文件名 = 会话 JSON 文件名」
+    run_id = str(uuid.uuid4())[:8]
+    log_file = setup_logging(
+        verbose=args.verbose, debug=args.debug, session_id=run_id,
+    )
 
-    # --list-sessions
+    # --list-sessions —— 复用 _sessions_list 的 Rich 表格渲染（向后兼容）
     if args.list_sessions:
         try:
             from nexus.cli.session import SessionManager
+            from nexus.cli.display import DisplayManager
         except ImportError:
             print("Session manager is not available yet.")
             return
         mgr = SessionManager()
-        sessions = mgr.list_sessions()
-        if not sessions:
-            print("No saved sessions.")
-        else:
-            for s in sessions:
-                print(f"  {s['id']}  {s['timestamp']}  {s['summary']}")
+        display = DisplayManager()
+        _sessions_list(mgr, display)
         return
 
     # 加载配置
@@ -393,7 +432,7 @@ def main() -> None:
     # 派发
     try:
         if args.continue_session:
-            _run_continue(agent, config)
+            _run_continue(agent, config, run_id=run_id, log_file=log_file)
         elif args.prompt:
             _run_single(agent, config, args.prompt)
         else:
@@ -401,7 +440,10 @@ def main() -> None:
             from nexus.cli.display import DisplayManager
 
             display = DisplayManager()
-            repl = Repl(agent=agent, display=display, config=config)
+            repl = Repl(
+                agent=agent, display=display, config=config,
+                run_id=run_id, log_file=log_file,
+            )
             asyncio.run(repl.run())
     finally:
         if args.save_config:
@@ -410,6 +452,199 @@ def main() -> None:
                 print(f"Config saved to {saved_path}")
             except Exception as e:
                 logger.warning("Failed to save config: %s", e)
+
+
+# ------------------------------------------------------------------
+# nexus sessions 子命令
+# ------------------------------------------------------------------
+
+
+def _run_sessions_command(argv: list[str]) -> None:
+    """``nexus sessions`` 子命令派发器。
+
+    支持三个子命令：
+    - ``nexus sessions [list]`` —— 列出历史会话（默认行为）
+    - ``nexus sessions delete <id>`` —— 删除指定会话（带二次确认）
+    - ``nexus sessions restore <id>`` —— 恢复指定会话并启动 REPL（带二次确认）
+    """
+    parser = argparse.ArgumentParser(
+        prog="nexus sessions",
+        description="管理历史会话：列出、删除、恢复",
+    )
+    sub = parser.add_subparsers(dest="subcommand", metavar="<command>")
+
+    # list（无子命令时的默认行为）
+    sub.add_parser("list", help="列出历史会话")
+
+    # delete
+    p_del = sub.add_parser("delete", help="删除指定会话")
+    p_del.add_argument("session_id", help="要删除的会话 ID")
+    p_del.add_argument(
+        "-y", "--yes", action="store_true",
+        help="跳过确认直接删除",
+    )
+    p_del.add_argument(
+        "--keep-logs", action="store_true",
+        help="保留日志文件，仅删除会话 JSON",
+    )
+
+    # restore
+    p_res = sub.add_parser("restore", help="恢复指定会话")
+    p_res.add_argument("session_id", help="要恢复的会话 ID")
+    p_res.add_argument(
+        "-y", "--yes", action="store_true",
+        help="跳过确认直接恢复",
+    )
+
+    args = parser.parse_args(argv)
+    subcmd = args.subcommand or "list"  # 无子命令时默认 list
+
+    # sessions 命令本身也写日志（临时 run_id），便于审计 sessions 操作
+    setup_logging()
+
+    from nexus.cli.session import SessionManager
+    from nexus.cli.display import DisplayManager
+    mgr = SessionManager()
+    display = DisplayManager()
+
+    if subcmd == "list":
+        _sessions_list(mgr, display)
+    elif subcmd == "delete":
+        _sessions_delete(
+            mgr, args.session_id,
+            confirm=not args.yes,
+            keep_logs=args.keep_logs,
+            display=display,
+        )
+    elif subcmd == "restore":
+        _sessions_restore(
+            mgr, args.session_id,
+            confirm=not args.yes,
+            display=display,
+        )
+
+
+def _sessions_list(mgr: "SessionManager", display: DisplayManager) -> None:
+    """列出历史会话（Rich 表格展示）。"""
+    sessions = mgr.list_sessions()
+    if not sessions:
+        print("No saved sessions.")
+        return
+    display.render_sessions_table(sessions)
+    print(
+        f"\n共 {len(sessions)} 条会话。"
+        "使用 `nexus sessions restore <id>` 恢复，"
+        "`nexus sessions delete <id>` 删除。"
+    )
+
+
+def _sessions_delete(
+    mgr: "SessionManager",
+    session_id: str,
+    confirm: bool,
+    keep_logs: bool,
+    display: DisplayManager,
+) -> None:
+    """删除指定会话（带二次确认）。"""
+    # 1. 预览：加载会话信息展示给用户
+    state = mgr.load(session_id)
+    if state is None:
+        print(f"Session not found: {session_id}")
+        return
+
+    sessions = mgr.list_sessions()
+    info = next((s for s in sessions if s["id"] == session_id), None)
+    summary = info["summary"] if info else "(unknown)"
+    msg_count = info["message_count"] if info else len(state.messages)
+    log_file = info.get("log_file") if info else None
+
+    print(f"\n  ID:       {session_id}")
+    print(f"  Summary:  {summary}")
+    print(f"  Messages: {msg_count}")
+    if log_file:
+        print(f"  Log file: {log_file}")
+    print()
+
+    # 2. 确认
+    if confirm:
+        answer = input(
+            f"Delete session {session_id}? This cannot be undone. (y/N) "
+        )
+        if answer.strip().lower() not in ("y", "yes"):
+            print("Cancelled.")
+            return
+
+    # 3. 执行删除
+    ok = mgr.delete(session_id, delete_logs=not keep_logs)
+    if ok:
+        print(f"Session {session_id} deleted.")
+        if keep_logs:
+            print("(Logs retained per --keep-logs)")
+    else:
+        print(f"Failed to delete session {session_id}.")
+
+
+def _sessions_restore(
+    mgr: "SessionManager",
+    session_id: str,
+    confirm: bool,
+    display: DisplayManager,
+) -> None:
+    """恢复指定会话并启动 REPL（带二次确认）。"""
+    state = mgr.load(session_id)
+    if state is None:
+        print(f"Session not found: {session_id}")
+        return
+
+    sessions = mgr.list_sessions()
+    info = next((s for s in sessions if s["id"] == session_id), None)
+    summary = info["summary"] if info else ""
+    msg_count = info["message_count"] if info else len(state.messages)
+
+    print(f"\n  ID:       {session_id}")
+    print(f"  Summary:  {summary}")
+    print(f"  Messages: {msg_count}")
+    print()
+
+    if confirm:
+        answer = input(
+            f"Restore session {session_id} and start REPL? (y/N) "
+        )
+        if answer.strip().lower() not in ("y", "yes"):
+            print("Cancelled.")
+            return
+
+    # 3. 启动 REPL 并恢复（使用新 run_id 写新日志，旧 session JSON 不动）
+    # 函数内部局部 import 避免循环依赖
+    from nexus.cli.config import load_config as _load_config
+    from nexus.cli.repl import Repl
+
+    work_dir = os.getcwd()
+    config = _load_config(work_dir=work_dir)
+    config.work_dir = work_dir
+
+    new_run_id = str(uuid.uuid4())[:8]
+    new_log_file = setup_logging(session_id=new_run_id)
+
+    llm = _create_llm(config)
+    agent = Agent(
+        llm=llm,
+        system_prompt=config.system_prompt,
+        max_steps=config.max_steps,
+    )
+    _register_tools(agent, config)
+
+    display.show_welcome()
+    repl = Repl(
+        agent=agent, display=display, config=config,
+        run_id=new_run_id, log_file=new_log_file,
+    )
+
+    async def _run() -> None:
+        await repl.restore_session(state)
+        await repl.run()
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

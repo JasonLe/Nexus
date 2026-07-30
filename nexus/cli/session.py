@@ -84,6 +84,8 @@ class SessionManager:
         state: AgentState,
         metadata: dict[str, Any] | None = None,
         auto_truncate: bool = True,
+        session_id: str | None = None,
+        log_file: str | None = None,
     ) -> str:
         """保存会话到文件。
 
@@ -99,13 +101,21 @@ class SessionManager:
         auto_truncate : bool
             是否在持久化前自动截断过长历史（保留最近 50 轮）。
             默认开启，防止会话文件膨胀。
+        session_id : str | None
+            显式指定会话 ID（用于覆盖同一会话文件）。
+            None 时生成新 uuid（保持向后兼容）。
+        log_file : str | None
+            关联日志文件路径。非空时写入 ``metadata.log_file``，
+            供会话删除时同步清理日志。
 
         Returns
         -------
         str
             会话唯一标识符（8 位 uuid 前缀）。
         """
-        session_id = str(uuid.uuid4())[:_SESSION_ID_LENGTH]
+        # 显式 session_id 优先；None 时生成新 uuid（向后兼容）
+        if session_id is None:
+            session_id = str(uuid.uuid4())[:_SESSION_ID_LENGTH]
 
         # 生成摘要：首条用户消息的前 80 字符，无用户消息则用 task 兜底
         summary = self._generate_summary(state)
@@ -117,12 +127,17 @@ class SessionManager:
             else state.serialize()
         )
 
+        # 合并 metadata 与 log_file（覆盖式保存也保留 log_file 关联）
+        merged_metadata: dict[str, Any] = dict(metadata or {})
+        if log_file:
+            merged_metadata["log_file"] = log_file
+
         session_data: dict[str, Any] = {
             "session_id": session_id,
             "version": "1.0",
             "created_at": datetime.now(timezone.utc).isoformat(),
             "summary": summary,
-            "metadata": metadata or {},
+            "metadata": merged_metadata,
             "state": serialized_state,
         }
 
@@ -210,6 +225,7 @@ class SessionManager:
             - timestamp:     创建时间（ISO 8601 字符串）
             - summary:       会话摘要文本
             - message_count: 消息条数
+            - log_file:      关联日志文件路径（从 metadata 读取，可能为 None）
             最多返回 20 条。
         """
         sessions: list[dict[str, Any]] = []
@@ -224,6 +240,7 @@ class SessionManager:
             try:
                 with open(f, "r", encoding="utf-8") as fh:
                     data = json.load(fh)
+                metadata = data.get("metadata") or {}
                 sessions.append(
                     {
                         "id": f.stem,
@@ -232,6 +249,7 @@ class SessionManager:
                         "message_count": len(
                             data.get("state", {}).get("messages", [])
                         ),
+                        "log_file": metadata.get("log_file"),
                     }
                 )
             except (json.JSONDecodeError, OSError):
@@ -244,34 +262,79 @@ class SessionManager:
 
         return sessions[:_DEFAULT_LIST_LIMIT]
 
-    def delete(self, session_id: str) -> bool:
+    def delete(self, session_id: str, delete_logs: bool = True) -> bool:
         """删除指定会话。
 
         永久删除对应的 JSON 文件，不可恢复。文件不存在时返回 False。
+        默认同步删除关联日志文件（``delete_logs=True``），保证会话与日志同步清理。
 
         Parameters
         ----------
         session_id : str
             要删除的会话 ID。
+        delete_logs : bool
+            是否同步删除关联日志文件。默认 True。日志清理策略：
+            1. 优先读取会话 JSON 的 ``metadata.log_file`` 字段并删除
+            2. 兜底：直接拼路径 ``~/.nexus/logs/<session_id>.log`` 删除
 
         Returns
         -------
         bool
-            True 表示删除成功，False 表示文件不存在。
+            True 表示会话 JSON 删除成功，False 表示文件不存在。
         """
         filepath = self.sessions_dir / f"{session_id}.json"
-        if filepath.exists():
-            filepath.unlink()
-            logger.info(
-                "Session deleted",
+
+        # 删除前先读取 metadata.log_file（仅 delete_logs=True 时需要）
+        log_file_to_delete: str | None = None
+        if delete_logs and filepath.exists():
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                metadata = data.get("metadata") or {}
+                log_file_to_delete = metadata.get("log_file")
+            except (json.JSONDecodeError, OSError):
+                # 读取失败也继续删除 JSON 文件本身
+                logger.warning(
+                    "Failed to read session metadata for log cleanup",
+                    extra={"session_id": session_id},
+                )
+
+        if not filepath.exists():
+            logger.warning(
+                "Session file not found for deletion",
                 extra={"session_id": session_id},
             )
-            return True
-        logger.warning(
-            "Session file not found for deletion",
-            extra={"session_id": session_id},
+            return False
+
+        filepath.unlink()
+
+        # 同步删除日志文件（两层兜底）
+        if delete_logs:
+            # 1. metadata.log_file 优先
+            if log_file_to_delete:
+                try:
+                    Path(log_file_to_delete).unlink(missing_ok=True)
+                except OSError:
+                    logger.warning(
+                        "Failed to delete log file from metadata",
+                        extra={"session_id": session_id, "log_file": log_file_to_delete},
+                    )
+            # 2. 兜底：拼路径 ~/.nexus/logs/<session_id>.log
+            fallback_log = Path.home() / ".nexus" / "logs" / f"{session_id}.log"
+            if fallback_log.exists():
+                try:
+                    fallback_log.unlink()
+                except OSError:
+                    logger.warning(
+                        "Failed to delete fallback log file",
+                        extra={"session_id": session_id, "log_file": str(fallback_log)},
+                    )
+
+        logger.info(
+            "Session deleted",
+            extra={"session_id": session_id, "delete_logs": delete_logs},
         )
-        return False
+        return True
 
     # ------------------------------------------------------------------
     # 内部辅助方法

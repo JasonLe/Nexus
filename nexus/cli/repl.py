@@ -62,6 +62,8 @@ class Repl:
         display: DisplayManager,
         config: NexusConfig,
         session_mgr: SessionManager | None = None,
+        run_id: str | None = None,
+        log_file: str | None = None,
     ) -> None:
         """初始化 REPL。
 
@@ -75,12 +77,21 @@ class Repl:
             CLI 配置。
         session_mgr : SessionManager | None
             会话管理器，为 None 时自动创建默认实例。
+        run_id : str | None
+            本进程的会话 ID，用于覆盖式保存（同一 REPL 多次 /save 写同一 JSON）。
+            None 时退化为原行为（每次 save 生成新 uuid）。
+        log_file : str | None
+            本进程的日志文件路径，写入会话 metadata.log_file，
+            便于会话删除时同步清理日志。
         """
         self.agent = agent
         self.display = display
         self.config = config
         self.session_mgr = session_mgr or SessionManager()
         self._running = False
+        # 用于覆盖式保存与日志关联
+        self._run_id = run_id
+        self._log_file = log_file
 
         # 跨轮对话历史：存储所有 run 的 messages，实现多轮对话上下文保持
         # 每条元素为 {"role": str, "content": str} 格式
@@ -102,6 +113,7 @@ class Repl:
             extra={
                 "agent_name": agent.name,
                 "history_file": str(history_file),
+                "session_id": run_id,
             },
         )
 
@@ -510,6 +522,9 @@ class Repl:
             session_id = self.session_mgr.save(
                 state,
                 metadata={"command": cmd, "mode": "repl"},
+                # 传入 run_id 实现覆盖式保存：同一 REPL 多次 /save 写同一 JSON
+                session_id=self._run_id,
+                log_file=self._log_file,
             )
             self.display.show_info(f"会话已保存 (id: {session_id})")
             logger.info(
@@ -561,7 +576,12 @@ class Repl:
                 task="repl session",
                 messages=list(self._conversation_history),
             )
-            self.session_mgr.save(state, metadata={"mode": "repl"})
+            self.session_mgr.save(
+                state,
+                metadata={"mode": "repl"},
+                session_id=self._run_id,
+                log_file=self._log_file,
+            )
         except Exception:
             logger.warning("Failed to save session on exit", exc_info=True)
 
