@@ -170,23 +170,71 @@ def _run_single(agent: Agent, config: NexusConfig, prompt: str) -> None:
 
         display = DisplayManager()
         from nexus.core.event.event_types import EventType
+        from nexus.core.event.types import Event
 
         display.render_divider()
         display.render_assistant_header()
 
         tool_count = 0
 
+        # 流式状态（每轮 LLM 调用重置）：thinking/response 的 Live 实例与累积文本
+        stream_state: dict[str, Any] = {
+            "thinking_live": None,
+            "response_live": None,
+            "thinking_acc": "",
+            "response_acc": "",
+        }
+
+        async def on_llm_chunk(event: Event) -> None:
+            """LLM chunk 到达：增量渲染思考链或回复。"""
+            delta_content = event.payload.get("delta_content", "")
+            delta_reasoning = event.payload.get("delta_reasoning", "")
+
+            if delta_reasoning:
+                if stream_state["thinking_live"] is None:
+                    stream_state["thinking_live"] = display.start_streaming_thinking()
+                stream_state["thinking_acc"] += delta_reasoning
+                display.update_streaming_thinking(
+                    stream_state["thinking_live"], stream_state["thinking_acc"])
+
+            if delta_content:
+                # thinking 结束后切换到 response：关闭 thinking Live
+                if stream_state["thinking_live"] is not None:
+                    stream_state["thinking_live"].stop()
+                    stream_state["thinking_live"] = None
+                if stream_state["response_live"] is None:
+                    stream_state["response_live"] = display.start_streaming_response()
+                stream_state["response_acc"] += delta_content
+                display.update_streaming_response(
+                    stream_state["response_live"], stream_state["response_acc"])
+
         async def on_after_llm(event) -> None:
+            """LLM 调用后：关闭流式 Live，统计 token，避免重复渲染。"""
+            # 关闭可能未关闭的 Live 实例
+            if stream_state["thinking_live"] is not None:
+                stream_state["thinking_live"].stop()
+                stream_state["thinking_live"] = None
+            if stream_state["response_live"] is not None:
+                stream_state["response_live"].stop()
+                stream_state["response_live"] = None
+
             payload = event.payload
             response = payload.get("response")
-            if response and hasattr(response, "content") and response.content:
-                has_tool_calls = bool(getattr(response, "tool_calls", None))
-                if has_tool_calls:
-                    display.render_thinking(response.content)
-                else:
-                    display.render_response(response.content)
-            elif payload.get("content"):
-                display.render_response(payload["content"])
+            # 非流式回退：未走流式时一次性渲染
+            if not stream_state["response_acc"]:
+                if response and hasattr(response, "content") and response.content:
+                    has_tool_calls = bool(getattr(response, "tool_calls", None))
+                    if has_tool_calls:
+                        display.render_thinking(response.content)
+                    else:
+                        display.render_response(response.content)
+                elif payload.get("content"):
+                    display.render_response(payload["content"])
+            # 流式已渲染 content 的场景：content 已显示，无需重复渲染
+
+            # 重置流式累积状态（为下一轮 LLM 调用准备）
+            stream_state["thinking_acc"] = ""
+            stream_state["response_acc"] = ""
 
         async def on_before_tool(event) -> None:
             nonlocal tool_count
@@ -210,14 +258,16 @@ def _run_single(agent: Agent, config: NexusConfig, prompt: str) -> None:
                 )
 
         await agent.events.subscribe(EventType.AFTER_LLM_CALL, on_after_llm)
+        await agent.events.subscribe(EventType.LLM_CHUNK, on_llm_chunk)
         await agent.events.subscribe(EventType.BEFORE_TOOL_CALL, on_before_tool)
         await agent.events.subscribe(EventType.AFTER_TOOL_CALL, on_after_tool)
 
         try:
-            with display.show_spinner("🤔 Nexus is working..."):
-                await agent.run(prompt)
+            # 流式模式下不使用 spinner：spinner 与 Rich Live 共享终端刷新会冲突
+            await agent.run(prompt)
         finally:
             await agent.events.unsubscribe(EventType.AFTER_LLM_CALL, on_after_llm)
+            await agent.events.unsubscribe(EventType.LLM_CHUNK, on_llm_chunk)
             await agent.events.unsubscribe(EventType.BEFORE_TOOL_CALL, on_before_tool)
             await agent.events.unsubscribe(EventType.AFTER_TOOL_CALL, on_after_tool)
 

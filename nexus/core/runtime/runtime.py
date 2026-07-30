@@ -56,7 +56,7 @@ from nexus.core.executor.actions import (
     ErrorAction,
 )
 from nexus.core.executor.policy import ExecutionPolicy
-from nexus.llm.base import BaseLLM
+from nexus.llm.base import BaseLLM, LLMResponse, ToolCall
 from nexus.tools.registry import ToolRegistry
 from nexus.tools.executor import ToolExecutor
 from nexus.plugins.registry import PluginRegistry
@@ -260,7 +260,7 @@ class Runtime:
 
         流程：
         1. 派发 BEFORE_LLM_CALL 事件
-        2. 调用 llm.chat()（非流式）获取 LLMResponse
+        2. 调用 LLM（流式或非流式）获取 LLMResponse
         3. 将 assistant 消息添加到 state.messages（含 tool_calls 信息）
         4. 将 _last_llm_response 存入 state.variables 供 Policy 读取
         5. 创建 Step 记录
@@ -304,11 +304,55 @@ class Runtime:
             },
         )
 
-        # 2. 调用 LLM
-        response = await context.llm.chat(
-            messages=action.messages,
-            tools=action.tools,
-        )
+        # 2. 调用 LLM（流式或非流式）
+        stream_mode = context.variables.get("_stream", True)
+
+        if stream_mode and hasattr(context.llm, "stream_chat"):
+            # 流式路径：聚合 chunks + 派发 LLM_CHUNK 事件
+            content_parts: list[str] = []
+            reasoning_parts: list[str] = []
+            tool_calls: list[ToolCall] = []
+            finish_reason: str | None = None
+
+            async for chunk in context.llm.stream_chat(
+                messages=action.messages, tools=action.tools,
+            ):
+                if chunk.delta_content:
+                    content_parts.append(chunk.delta_content)
+                if chunk.delta_reasoning:
+                    reasoning_parts.append(chunk.delta_reasoning)
+                if chunk.delta_tool_calls:
+                    tool_calls = chunk.delta_tool_calls
+                if chunk.finish_reason:
+                    finish_reason = chunk.finish_reason
+
+                # 派发 LLM_CHUNK 事件
+                await self._event_bus.publish(Event(
+                    type=EventType.LLM_CHUNK,
+                    payload={
+                        "delta_content": chunk.delta_content,
+                        "delta_reasoning": chunk.delta_reasoning,
+                        "delta_tool_calls": chunk.delta_tool_calls,
+                        "finish_reason": chunk.finish_reason,
+                    },
+                    run_id=state.run_id,
+                    step=state.current_step,
+                ))
+
+            # 构造 LLMResponse 供后续逻辑复用
+            response = LLMResponse(
+                content="".join(content_parts),
+                tool_calls=tool_calls,
+                finish_reason=finish_reason or "",
+                usage=None,
+                model=getattr(context.llm, "model", "unknown"),
+            )
+        else:
+            # 非流式回退路径（原逻辑）
+            response = await context.llm.chat(
+                messages=action.messages,
+                tools=action.tools,
+            )
 
         # 3. 将 assistant 消息写入 state.messages
         assistant_msg: dict[str, Any] = {"role": "assistant"}

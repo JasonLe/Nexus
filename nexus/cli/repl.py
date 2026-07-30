@@ -268,9 +268,11 @@ class Repl:
         展示流程：
         1. 渲染用户消息 Panel（绿色边框，👤 You 标签）
         2. 渲染轮次分隔线 + AI 标签（🤖 Nexus）
-        3. 在 spinner 包裹下执行 Agent.run()，事件回调驱动实时展示：
-           - AFTER_LLM_CALL：有 tool_calls → 渲染思考链（灰色 dim Panel）；
-             无 tool_calls → 渲染最终回复（亮色 Markdown）
+        3. 执行 Agent.run()，事件回调驱动实时展示（流式模式不使用 spinner，
+           避免与 Rich Live 终端刷新冲突）：
+           - LLM_CHUNK：增量渲染思考链（dim italic Live）与回复（Markdown Live）
+           - AFTER_LLM_CALL：关闭流式 Live、统计 token；
+             非流式回退时一次性渲染思考链或回复
            - AFTER_TOOL_CALL：渲染工具调用 Panel（青色/红色边框）
            - ON_ERROR：渲染错误 Panel（红色边框）
         4. 维护跨轮对话历史
@@ -288,20 +290,79 @@ class Repl:
         token_usage: dict[str, int] = {"prompt": 0, "completion": 0, "total": 0}
         finish_event: asyncio.Event = asyncio.Event()
 
+        # 流式状态（每轮 LLM 调用重置）：thinking/response 的 Live 实例与累积文本
+        stream_state: dict[str, Any] = {
+            "thinking_live": None,
+            "response_live": None,
+            "thinking_acc": "",
+            "response_acc": "",
+        }
+
+        async def on_llm_chunk(event: Event) -> None:
+            """LLM chunk 到达：增量渲染思考链或回复。
+
+            根据 chunk 的 delta_reasoning / delta_content 字段分别驱动
+            thinking 与 response 的 Live 实例。思考链先于回复出现，
+            收到首个 delta_content 时关闭 thinking Live 并切换到 response。
+            """
+            delta_content = event.payload.get("delta_content", "")
+            delta_reasoning = event.payload.get("delta_reasoning", "")
+
+            if delta_reasoning:
+                if stream_state["thinking_live"] is None:
+                    stream_state["thinking_live"] = self.display.start_streaming_thinking()
+                stream_state["thinking_acc"] += delta_reasoning
+                self.display.update_streaming_thinking(
+                    stream_state["thinking_live"], stream_state["thinking_acc"])
+
+            if delta_content:
+                # thinking 结束后切换到 response：关闭 thinking Live
+                if stream_state["thinking_live"] is not None:
+                    stream_state["thinking_live"].stop()
+                    stream_state["thinking_live"] = None
+                if stream_state["response_live"] is None:
+                    stream_state["response_live"] = self.display.start_streaming_response()
+                stream_state["response_acc"] += delta_content
+                self.display.update_streaming_response(
+                    stream_state["response_live"], stream_state["response_acc"])
+
         async def on_after_llm(event: Event) -> None:
-            """LLM 调用后：区分思考链与最终回复。"""
+            """LLM 调用后：关闭流式 Live，统计 token，避免重复渲染。
+
+            流式路径下内容已通过 LLM_CHUNK 事件增量渲染完毕，
+            此处仅做收尾（关闭 Live、统计 token）。
+            非流式路径下（stream=False）response_acc 为空，
+            仍走一次性渲染逻辑。
+            """
+            # 关闭可能未关闭的 Live 实例（thinking 收到 content 时已关闭，
+            # 但若纯 thinking 无 content 则需在此兜底关闭）
+            if stream_state["thinking_live"] is not None:
+                stream_state["thinking_live"].stop()
+                stream_state["thinking_live"] = None
+            if stream_state["response_live"] is not None:
+                stream_state["response_live"].stop()
+                stream_state["response_live"] = None
+
             response = event.payload.get("response")
             usage = event.payload.get("usage")
             if usage:
                 token_usage["prompt"] += usage.get("prompt_tokens", 0)
                 token_usage["completion"] += usage.get("completion_tokens", 0)
                 token_usage["total"] += usage.get("total_tokens", 0)
-            if response and hasattr(response, "content") and response.content:
+
+            # 非流式回退：未走流式时一次性渲染
+            if not stream_state["response_acc"] and response and hasattr(response, "content") and response.content:
                 has_tool_calls = bool(getattr(response, "tool_calls", None))
                 if has_tool_calls:
                     self.display.render_thinking(response.content)
                 else:
                     self.display.render_response(response.content)
+            # 流式已渲染 content 的场景：content 已显示，
+            # 若同时存在 tool_calls 则由 on_after_tool 处理，此处无需重复渲染
+
+            # 重置流式累积状态（为下一轮 LLM 调用准备）
+            stream_state["thinking_acc"] = ""
+            stream_state["response_acc"] = ""
 
         async def on_before_tool(event: Event) -> None:
             """工具调用前：累加计数器（spinner 已显示工作状态，无需额外打印）。"""
@@ -344,19 +405,20 @@ class Repl:
             finish_event.set()
 
         await self.agent.events.subscribe(EventType.AFTER_LLM_CALL, on_after_llm)
+        await self.agent.events.subscribe(EventType.LLM_CHUNK, on_llm_chunk)
         await self.agent.events.subscribe(EventType.BEFORE_TOOL_CALL, on_before_tool)
         await self.agent.events.subscribe(EventType.AFTER_TOOL_CALL, on_after_tool)
         await self.agent.events.subscribe(EventType.ON_ERROR, on_error)
         await self.agent.events.subscribe(EventType.ON_FINISH, on_finish)
 
         try:
-            with self.display.show_spinner("🤔 Nexus is working..."):
-                state: AgentState = await self.agent.run(
-                    user_input,
-                    initial_messages=(
-                        self._conversation_history if self._conversation_history else None
-                    ),
-                )
+            # 流式模式下不使用 spinner：spinner 与 Rich Live 共享终端刷新会冲突
+            state: AgentState = await self.agent.run(
+                user_input,
+                initial_messages=(
+                    self._conversation_history if self._conversation_history else None
+                ),
+            )
 
             self._conversation_history.append({"role": "user", "content": user_input})
             for msg in state.messages:
@@ -383,6 +445,7 @@ class Repl:
 
         finally:
             await self.agent.events.unsubscribe(EventType.AFTER_LLM_CALL, on_after_llm)
+            await self.agent.events.unsubscribe(EventType.LLM_CHUNK, on_llm_chunk)
             await self.agent.events.unsubscribe(EventType.BEFORE_TOOL_CALL, on_before_tool)
             await self.agent.events.unsubscribe(EventType.AFTER_TOOL_CALL, on_after_tool)
             await self.agent.events.unsubscribe(EventType.ON_ERROR, on_error)

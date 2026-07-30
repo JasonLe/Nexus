@@ -23,7 +23,7 @@ class EventType(Enum):
     EventBus 以此枚举值作为事件路由的索引 key。
 
     事件触发顺序（典型一次 Agent 运行）：
-    BEFORE_AGENT_RUN -> [BEFORE_LLM_CALL -> AFTER_LLM_CALL -> BEFORE_TOOL_CALL -> AFTER_TOOL_CALL]* -> AFTER_AGENT_RUN -> ON_FINISH
+    BEFORE_AGENT_RUN -> [BEFORE_LLM_CALL -> [LLM_CHUNK...]* -> AFTER_LLM_CALL -> BEFORE_TOOL_CALL -> AFTER_TOOL_CALL]* -> AFTER_AGENT_RUN -> ON_FINISH
     若中途发生异常，触发 ON_ERROR。
     """
 
@@ -35,6 +35,10 @@ class EventType(Enum):
 
     BEFORE_LLM_CALL = auto()
     """LLM 调用前触发。payload 含 model、provider、messages、tools。"""
+
+    LLM_CHUNK = auto()
+    """流式 LLM 调用过程中每个 chunk 到达时触发。
+    payload 含 delta_content、delta_reasoning、delta_tool_calls、finish_reason。"""
 
     AFTER_LLM_CALL = auto()
     """LLM 调用后触发。payload 含 model、provider、response、usage。"""

@@ -254,7 +254,6 @@ class AnthropicLLM(BaseLLM):
                 "model": self.model,
                 "max_tokens": kwargs.pop("max_tokens", 4096),
                 "messages": anthropic_messages,
-                "stream": True,
             }
 
             if system_prompt:
@@ -271,6 +270,7 @@ class AnthropicLLM(BaseLLM):
             async with self._client.messages.stream(**params) as stream:
                 async for event in stream:
                     delta_content = ""
+                    delta_reasoning = ""
                     delta_tool_calls: list[ToolCall] = []
 
                     if event.type == "content_block_start":
@@ -286,6 +286,9 @@ class AnthropicLLM(BaseLLM):
                         if delta.type == "text_delta":
                             # P0-2 修复：传增量文本而非累积全文
                             delta_content = delta.text
+                        elif delta.type == "thinking_delta":
+                            # Claude 的思考链增量内容
+                            delta_reasoning = delta.thinking
                         elif delta.type == "input_json_delta":
                             if event.index in pending_tool_calls:
                                 pending_tool_calls[event.index]["arguments"] += (
@@ -314,9 +317,10 @@ class AnthropicLLM(BaseLLM):
                             )
 
                     # 仅在有增量内容或结束信号时 yield，避免空 chunk
-                    if delta_content or delta_tool_calls or final_stop_reason:
+                    if delta_content or delta_reasoning or delta_tool_calls or final_stop_reason:
                         yield LLMChunk(
                             delta_content=delta_content,
+                            delta_reasoning=delta_reasoning,
                             delta_tool_calls=delta_tool_calls,
                             finish_reason=final_stop_reason,
                         )

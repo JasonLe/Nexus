@@ -118,6 +118,9 @@ class LLMChunk:
     ----------
     delta_content : str
         本块的增量文本内容。
+    delta_reasoning : str
+        本块的思考链增量内容。来源于 OpenAI o1/o3 系列的 reasoning_content
+        字段或 Anthropic Claude 的 thinking block。
     delta_tool_calls : list[ToolCall]
         本块新出现的工具调用片段（增量）。
     finish_reason : str | None
@@ -125,6 +128,7 @@ class LLMChunk:
     """
 
     delta_content: str = ""
+    delta_reasoning: str = ""
     delta_tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str | None = None
 

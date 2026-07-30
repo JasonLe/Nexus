@@ -149,6 +149,85 @@ class DisplayManager:
         return accumulated
 
     # ------------------------------------------------------------------
+    # 增量流式渲染（事件驱动）
+    # ------------------------------------------------------------------
+    # 与 render_streaming_response 的区别：
+    # - render_streaming_response 接收 AsyncIterator，内部驱动迭代
+    # - 以下 4 个方法面向事件回调：start_* 创建 Live 实例返回给调用方，
+    #   update_* 在每个 LLM_CHUNK 事件到来时增量更新，调用方在流结束后 stop()
+    # ------------------------------------------------------------------
+
+    def start_streaming_thinking(self) -> Live:
+        """开启思考链流式渲染，返回 Live 实例供后续更新。
+
+        使用灰色 dim italic 样式渲染思考链增量内容，
+        与正式回复形成明确的视觉层次区分（思考过程低权重）。
+
+        Returns
+        -------
+        Live
+            已启动的 Rich Live 实例，调用方持有并在每个 chunk 到来时
+            调用 ``update_streaming_thinking`` 更新内容，
+            流结束后调用 ``live.stop()`` 关闭。
+        """
+        live = Live(
+            Text("", style="dim italic"),
+            console=self.console,
+            refresh_per_second=10,
+            vertical_overflow="visible",
+            transient=False,
+        )
+        live.start()
+        return live
+
+    def update_streaming_thinking(self, live: Live, accumulated: str) -> None:
+        """更新思考链累积内容。
+
+        Parameters
+        ----------
+        live : Live
+            ``start_streaming_thinking`` 返回的 Live 实例。
+        accumulated : str
+            当前累积的思考链全文（非增量），由调用方维护拼接。
+        """
+        live.update(Text(accumulated, style="dim italic"))
+
+    def start_streaming_response(self) -> Live:
+        """开启回复流式渲染，返回 Live 实例。
+
+        使用 Markdown 渲染增量累积的回复内容，与 render_streaming_response
+        的渲染样式一致（亮色 Markdown），但生命周期由调用方管理。
+
+        Returns
+        -------
+        Live
+            已启动的 Rich Live 实例，调用方持有并在每个 chunk 到来时
+            调用 ``update_streaming_response`` 更新内容，
+            流结束后调用 ``live.stop()`` 关闭。
+        """
+        live = Live(
+            Markdown(""),
+            console=self.console,
+            refresh_per_second=10,
+            vertical_overflow="visible",
+            transient=False,
+        )
+        live.start()
+        return live
+
+    def update_streaming_response(self, live: Live, accumulated: str) -> None:
+        """更新回复累积内容。
+
+        Parameters
+        ----------
+        live : Live
+            ``start_streaming_response`` 返回的 Live 实例。
+        accumulated : str
+            当前累积的回复全文（非增量），由调用方维护拼接。
+        """
+        live.update(Markdown(accumulated))
+
+    # ------------------------------------------------------------------
     # 工具调用展示
     # ------------------------------------------------------------------
 

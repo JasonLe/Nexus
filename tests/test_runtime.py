@@ -52,7 +52,11 @@ class MockLLM(BaseLLM):
     async def stream_chat(self, messages, tools=None, **kwargs):
         resp = self.responses[min(self._call_count, len(self.responses) - 1)]
         self._call_count += 1
-        yield LLMChunk(delta_content=resp.content)
+        yield LLMChunk(
+            delta_content=resp.content or "",
+            delta_tool_calls=resp.tool_calls,
+            finish_reason=resp.finish_reason or None,
+        )
         return
 
 

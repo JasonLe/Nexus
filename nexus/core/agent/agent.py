@@ -90,6 +90,7 @@ class Agent:
         system_prompt: str | None = None,
         max_steps: int = 20,
         name: str = "nexus",
+        stream: bool = True,
     ) -> None:
         """初始化 Agent。
 
@@ -109,6 +110,9 @@ class Agent:
             默认为 20 步，防止 LLM 无限循环调用工具。
         name : str
             Agent 名称，用于日志和事件追踪。默认为 "nexus"。
+        stream : bool
+            是否启用流式输出。默认为 True，Runtime 将调用 stream_chat()
+            并逐 chunk 派发 LLM_CHUNK 事件；设为 False 时回退到非流式 chat()。
         """
         self.runtime = Runtime()
         self.llm = llm
@@ -116,6 +120,7 @@ class Agent:
         self.system_prompt = system_prompt
         self.max_steps = max_steps
         self.name = name
+        self._stream = stream
 
         # 快捷访问：让用户可以直接 agent.tool_registry.register(...) 等方式操作
         self.tool_registry = self.runtime._tool_registry
@@ -226,6 +231,11 @@ class Agent:
             messages.append({"role": "system", "content": self.system_prompt})
         if initial_messages:
             messages.extend(initial_messages)
+
+        # 将流式开关注入 variables，供 Runtime._execute_llm_call 读取
+        if variables is None:
+            variables = {}
+        variables["_stream"] = self._stream
 
         logger.info(
             "Agent.run starting",

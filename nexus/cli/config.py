@@ -29,6 +29,7 @@
       base_url: https://api.minimaxi.com/anthropic
 
   default_provider: openai         # 默认 Provider
+  stream: true                     # 流式输出开关，默认开启
 
   agent:
     system_prompt: "You are a helpful coding assistant."
@@ -103,6 +104,7 @@ class NexusConfig:
     default_provider: str = "openai"
     agent: AgentConfig = field(default_factory=AgentConfig)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
+    stream: bool = True  # 流式输出开关，默认开启
 
     # 运行时字段（不从配置文件直接写入，由 CLI 或 load_config 动态设置）
     verbose: bool = False

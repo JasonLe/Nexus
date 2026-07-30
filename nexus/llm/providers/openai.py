@@ -318,6 +318,11 @@ class OpenAILLM(BaseLLM):
 
             delta_content: str = delta.content or ""
 
+            # OpenAI o1/o3 系列的推理内容（reasoning_content 字段）
+            delta_reasoning: str = ""
+            if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+                delta_reasoning = delta.reasoning_content
+
             # 增量合并 tool_calls
             delta_tool_calls: list[ToolCall] = []
             if delta.tool_calls:
@@ -366,6 +371,7 @@ class OpenAILLM(BaseLLM):
 
             yield LLMChunk(
                 delta_content=delta_content,
+                delta_reasoning=delta_reasoning,
                 delta_tool_calls=delta_tool_calls,
                 finish_reason=finish_reason,
             )
