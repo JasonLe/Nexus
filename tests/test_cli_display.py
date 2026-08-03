@@ -7,13 +7,18 @@
 - render_assistant_header AI 标签
 - render_divider 轮次分隔线
 - render_thinking 思考链 Panel
-- render_tool_call 成功 / 失败展示（含 Panel 和序号）
+- render_tool_call 成功 / 失败展示（紧凑单行式 Panel 和序号）
+- print_thinking_chunk 流式 gutter（│ 行首竖线前缀）
+- render_tools_table 已注册工具表格（空列表 / 非空列表 / 参数提取）
+- render_help_panel 帮助 Panel（内置命令 + 快捷键）
 - render_error 渲染错误信息
 - render_summary 渲染摘要表格
 - show_info 渲染普通信息
 - render_response AI 回复 Markdown
 
 所有测试使用 io.StringIO 捕获 Console 输出，验证渲染内容不为空。
+gutter 测试使用 force_terminal=False 的 Console，输出无 ANSI 转义，
+便于直接断言每行行首的 │ 前缀。
 """
 
 import io
@@ -188,7 +193,7 @@ class TestDisplayToolCall:
         assert "Permission denied" in output
 
     def test_render_tool_call_with_index(self, display):
-        """带序号的工具调用应在 title 中显示序号。"""
+        """带序号的工具调用应在 title 中显示序号（🔧 [n] name 格式）。"""
         display.render_tool_call(
             tool_name="list_dir",
             args={"path": "."},
@@ -198,8 +203,34 @@ class TestDisplayToolCall:
         )
         output = _get_output(display)
         assert len(output) > 0
-        assert "Tool" in output
+        assert "[1]" in output
         assert "list_dir" in output
+
+    def test_render_tool_call_failure_with_index(self, display):
+        """失败的工具调用 title 应使用 ❌ [n] name 格式。"""
+        display.render_tool_call(
+            tool_name="shell",
+            args={"command": "rm -rf /"},
+            result="Permission denied",
+            success=False,
+            index=2,
+        )
+        output = _get_output(display)
+        assert "[2]" in output
+        assert "shell" in output
+        assert "Permission denied" in output
+
+    def test_render_tool_call_empty_args(self, display):
+        """无参数的工具调用应显示（无参数）占位。"""
+        display.render_tool_call(
+            tool_name="current_time",
+            args={},
+            result="2026-08-03 12:00:00",
+            success=True,
+        )
+        output = _get_output(display)
+        assert "current_time" in output
+        assert "无参数" in output
 
 
 class TestDisplayError:
@@ -263,4 +294,172 @@ class TestShowSpinner:
             pass
         output = _get_output(display)
         assert len(output) >= 0  # spinner 可能输出也可能不输出，只要不抛异常
+
+
+class TestThinkingGutter:
+    """测试 Thinking 流式 gutter 渲染（│ 行首竖线前缀）。"""
+
+    def _make_plain_display(self) -> DisplayManager:
+        """创建无 ANSI 转义输出的 DisplayManager，便于断言行首前缀。"""
+        dm = DisplayManager()
+        dm.console = Console(file=io.StringIO(), force_terminal=False, width=120)
+        return dm
+
+    def test_gutter_prefix_per_line(self):
+        """多行 chunk 时每个内容行都应以 │ 前缀开头。"""
+        dm = self._make_plain_display()
+        dm.print_thinking_start()
+        dm.print_thinking_chunk("first line\nsecond line\nthird line")
+        dm.end_thinking_stream()
+        output = dm.console.file.getvalue()
+
+        lines = [line for line in output.splitlines() if line.strip()]
+        # 首行为 🤔 Thinking 标题，其余为内容行
+        assert "Thinking" in lines[0]
+        content_lines = lines[1:]
+        assert len(content_lines) == 3
+        for line in content_lines:
+            assert line.startswith("│ "), f"内容行缺少 gutter 前缀: {line!r}"
+        assert content_lines[0] == "│ first line"
+        assert content_lines[1] == "│ second line"
+        assert content_lines[2] == "│ third line"
+
+    def test_gutter_prefix_across_chunks(self):
+        """跨 chunk 的不完整行不应重复补前缀，换行后的新行应补前缀。"""
+        dm = self._make_plain_display()
+        dm.print_thinking_start()
+        # 第一个 chunk 不含换行：前缀只补一次
+        dm.print_thinking_chunk("abc")
+        dm.print_thinking_chunk("def\nghi")
+        # 第二个 chunk 以换行结尾：下一 chunk 的内容应在新行并带前缀
+        dm.print_thinking_chunk("\njkl")
+        dm.end_thinking_stream()
+        output = dm.console.file.getvalue()
+
+        content_lines = [
+            line for line in output.splitlines()
+            if line.strip() and "Thinking" not in line
+        ]
+        assert content_lines == ["│ abcdef", "│ ghi", "│ jkl"]
+
+    def test_gutter_reset_on_new_stream(self):
+        """end_thinking_stream 后新一轮流的首行仍应带 gutter 前缀。"""
+        dm = self._make_plain_display()
+        dm.print_thinking_start()
+        dm.print_thinking_chunk("round one")
+        dm.end_thinking_stream()
+        # 不调用 print_thinking_start 也应因 end 重置状态而带前缀
+        dm.print_thinking_chunk("round two")
+        dm.end_thinking_stream()
+        output = dm.console.file.getvalue()
+
+        content_lines = [
+            line for line in output.splitlines()
+            if line.strip() and "Thinking" not in line
+        ]
+        assert content_lines == ["│ round one", "│ round two"]
+
+    def test_empty_chunk_no_output(self):
+        """空 chunk 不应产生任何输出。"""
+        dm = self._make_plain_display()
+        dm.print_thinking_chunk("")
+        assert dm.console.file.getvalue() == ""
+
+
+class TestRenderToolsTable:
+    """测试已注册工具表格渲染。"""
+
+    @staticmethod
+    def _fake_tool(name: str, description: str, schema: dict):
+        """构造具有 name/description/schema 属性的假工具对象。"""
+        from types import SimpleNamespace
+
+        return SimpleNamespace(name=name, description=description, schema=schema)
+
+    def test_render_tools_table_empty(self, display):
+        """空列表应打印 dim 提示而非表格。"""
+        display.render_tools_table([])
+        output = _get_output(display)
+        assert "暂无已注册的工具" in output
+
+    def test_render_tools_table_with_tools(self, display):
+        """非空列表应渲染表格，含名称、描述和参数列（必填加 *）。"""
+        tools = [
+            self._fake_tool(
+                "read_file",
+                "读取指定文件的内容",
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "encoding": {"type": "string"},
+                    },
+                    "required": ["path"],
+                },
+            ),
+            self._fake_tool(
+                "shell",
+                "执行 shell 命令",
+                {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            ),
+        ]
+        display.render_tools_table(tools)
+        output = _get_output(display)
+        assert "已注册工具" in output
+        assert "read_file" in output
+        assert "shell" in output
+        assert "读取指定文件的内容" in output
+        # 必填参数带 *，可选参数不带
+        assert "path*" in output
+        assert "encoding" in output
+        assert "command*" in output
+
+    def test_render_tools_table_no_params(self, display):
+        """无参数的 schema 应显示 - 占位。"""
+        tools = [
+            self._fake_tool(
+                "current_time",
+                "获取当前时间",
+                {"type": "object", "properties": {}},
+            ),
+        ]
+        display.render_tools_table(tools)
+        output = _get_output(display)
+        assert "current_time" in output
+        assert "-" in output
+
+    def test_render_tools_table_long_description_truncated(self, display):
+        """超长描述应截断到 ~50 字符。"""
+        tools = [
+            self._fake_tool("big_tool", "描" * 100, {"properties": {"q": {}}}),
+        ]
+        display.render_tools_table(tools)
+        output = _get_output(display)
+        assert "..." in output
+
+
+class TestRenderHelpPanel:
+    """测试帮助 Panel 渲染。"""
+
+    def test_render_help_panel(self, display):
+        """帮助 Panel 应包含全部内置命令和快捷键说明。"""
+        display.render_help_panel()
+        output = _get_output(display)
+        assert len(output) > 0
+        assert "帮助" in output
+        # 内置命令
+        for cmd in ("/clear", "/save", "/tools", "/quit", "/help"):
+            assert cmd in output
+        # 命令说明（抽查）
+        assert "清空对话上下文" in output
+        assert "列出已注册工具" in output
+        # 快捷键
+        assert "Ctrl+C" in output
+        assert "Ctrl+D" in output
+        assert "Esc+Enter" in output
+        assert "中断当前任务" in output
 

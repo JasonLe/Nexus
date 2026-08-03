@@ -31,6 +31,11 @@ cli = [
     "rich>=13.0.0",
     "prompt-toolkit>=3.0.0",
 ]
+server = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "websockets>=12",
+]
 
 [project.scripts]
 nexus = "nexus.cli.main:main"

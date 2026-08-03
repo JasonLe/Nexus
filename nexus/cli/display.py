@@ -28,7 +28,6 @@ from rich.spinner import Spinner
 from rich.status import Status
 from rich.table import Table
 from rich.text import Text
-from rich.tree import Tree
 
 from nexus.logging import get_logger
 
@@ -76,6 +75,9 @@ class DisplayManager:
         self.console = Console()
         self._start_time = time.time()
         self._response_buffer: str = ""
+        # Thinking 流式 gutter 的「行首」状态：True 表示下一个非空输出
+        # 位于新行行首，需要先补 dim 的 │ 竖线前缀，形成连续可视 gutter
+        self._thinking_at_line_start: bool = True
 
     # ------------------------------------------------------------------
     # 欢迎 / 告别
@@ -367,19 +369,20 @@ class DisplayManager:
         success: bool = True,
         index: int | None = None,
     ) -> None:
-        """渲染工具调用（含参数和结果），使用彩色 Panel 包裹 Tree。
+        """渲染工具调用（含参数和结果），紧凑单行式 Panel。
 
-        使用 Rich Tree 组件呈现工具调用细节，外层用 Panel 包裹提升视觉辨识度：
+        紧凑布局设计（替代旧的 Tree 嵌套）：
+        - Panel title 显示序号和工具名：成功 ``🔧 [n] name``，失败 ``❌ [n] name``
+        - 内容区第一行为 dim 参数摘要（单行，超长截断）
+        - 内容区第二行为结果：✅/❌ 图标 + 结果文本 + 耗时
         - 成功时青色边框，失败时红色边框
-        - Panel title 显示工具序号和名称
-        - Tree 根节点展示参数摘要，子节点展示执行结果
 
         Parameters
         ----------
         tool_name : str
             被调用的工具名称。
         args : dict
-            工具参数，用于在 Tree 节点中展示关键信息。
+            工具参数，用于生成单行参数摘要。
         result : str
             工具执行结果摘要文本（如 "156 lines read"）。
         duration_ms : float
@@ -389,31 +392,34 @@ class DisplayManager:
         index : int | None
             工具调用序号（从 1 开始），用于 Panel title 显示。
         """
+        # 参数摘要：k=v 形式单行拼接，单个值超长截断
         args_summary_parts: list[str] = []
         for k, v in args.items():
             v_str = str(v)
             if len(v_str) > 40:
                 v_str = v_str[:37] + "..."
             args_summary_parts.append(f"{k}={v_str}")
-        args_summary = ", ".join(args_summary_parts)
-
-        tree = Tree(f"🔧 {tool_name}({args_summary})")
+        args_summary = ", ".join(args_summary_parts) or "(无参数)"
 
         icon = "✅" if success else "❌"
-        duration_str = f" ({duration_ms:.1f}ms)" if duration_ms > 0 else ""
-        tree.add(f"{icon} {result}{duration_str}")
+        duration_str = f" · {duration_ms:.1f}ms" if duration_ms > 0 else ""
 
-        border_style = "cyan" if success else "red"
-        title_prefix = f"🔧 Tool [{index}] " if index is not None else "🔧 Tool "
-        title = f"{title_prefix}{tool_name}"
-        if not success:
-            title = f"❌ Tool [{index}] {tool_name}" if index is not None else f"❌ Tool {tool_name}"
+        # 内容区：dim 参数摘要行 + 结果行（Group 垂直组合两行文本）
+        content = Group(
+            Text(args_summary, style="dim"),
+            Text(f"{icon} {result}{duration_str}"),
+        )
+
+        # title：🔧 [n] name（失败时 ❌ [n] name），无序号时省略 [n]
+        icon_title = "🔧" if success else "❌"
+        index_str = f" [{index}]" if index is not None else ""
+        title = f"{icon_title}{index_str} {tool_name}"
 
         self.console.print(Panel(
-            tree,
+            content,
             title=title,
             title_align="left",
-            border_style=border_style,
+            border_style="cyan" if success else "red",
             padding=(0, 1),
         ))
         log_fn = logger.info if success else logger.warning
@@ -492,30 +498,52 @@ class DisplayManager:
         """流式思考开始：打印 🤔 Thinking 标题（静态，无 spinner）。
 
         纯 append 模式，不使用 Live/Status，不发送任何光标控制序列，
-        滚动绝对安全。思考内容通过 ``print_thinking_chunk`` 增量追加。
+        滚动绝对安全。思考内容通过 ``print_thinking_chunk`` 增量追加，
+        每行行首带 dim 的 ``│ `` 竖线前缀，形成连续的可视 gutter 块。
 
         设计原因：Live（transient=True）在 stop 时发送光标控制序列
         擦除内容，用户滚动终端后光标定位错乱，导致擦除失败、旧内容
         残留 + render_thinking 重复打印 = 多次输出。改用纯 append
         彻底消除光标控制序列。
         """
+        # 每轮思考流开始时重置行首状态，确保首行内容也带 gutter 前缀
+        self._thinking_at_line_start = True
         self.console.print("[dim]🤔 Thinking[/dim]")
 
     def print_thinking_chunk(self, chunk: str) -> None:
-        """流式打印思考内容（dim italic，append 模式，滚动安全）。
+        """流式打印思考内容（dim italic，行首 │ gutter，append 模式，滚动安全）。
+
+        逐段处理 chunk 中的换行：维护「行首」状态
+        （``_thinking_at_line_start``），每个新行的首个非空输出前补
+        dim 的 ``│ `` 前缀。chunk 内不含换行时直接追加到当前行，
+        跨 chunk 的不完整行由状态位保证前缀只补一次。
 
         Parameters
         ----------
         chunk : str
             本次到达的增量思考文本。
         """
-        if chunk:
-            self.console.print(chunk, style="dim italic", end="", soft_wrap=True)
-            self.console.file.flush()
+        if not chunk:
+            return
+        # 按 \n 拆分逐段处理：split 后除首段外，每段之前都隐含一个换行
+        segments = chunk.split("\n")
+        for i, segment in enumerate(segments):
+            if i > 0:
+                # 输出换行本身，进入新行行首状态
+                self.console.print("", end="\n", soft_wrap=True)
+                self._thinking_at_line_start = True
+            if segment:
+                if self._thinking_at_line_start:
+                    # 行首：先补 gutter 竖线前缀（dim），再输出内容
+                    self.console.print("│ ", style="dim", end="", soft_wrap=True)
+                    self._thinking_at_line_start = False
+                self.console.print(segment, style="dim italic", end="", soft_wrap=True)
+        self.console.file.flush()
 
     def end_thinking_stream(self) -> None:
-        """流式思考结束：打印换行收尾。"""
+        """流式思考结束：打印换行收尾，并重置 gutter 行首状态。"""
         self.console.print()
+        self._thinking_at_line_start = True
 
     # ------------------------------------------------------------------
     # 错误 / 警告展示
@@ -613,6 +641,101 @@ class DisplayManager:
 
         self.console.print(table)
         logger.info("Sessions table rendered", extra={"count": len(sessions)})
+
+    # ------------------------------------------------------------------
+    # 工具列表 / 帮助
+    # ------------------------------------------------------------------
+
+    def render_tools_table(self, tools: list) -> None:
+        """渲染已注册工具列表为 Rich Table。
+
+        在 ``/tools`` 命令中使用，将工具注册表中的工具渲染为三列表格：
+        名称（cyan 加粗）/ 描述（截断到 ~50 字符）/ 参数（必填加 ``*``）。
+
+        Parameters
+        ----------
+        tools : list
+            工具对象列表，每个工具应具有 ``name`` / ``description`` /
+            ``schema``（JSON Schema dict）属性。空列表时打印 dim 提示。
+        """
+        if not tools:
+            self.console.print(Text("（暂无已注册的工具）", style="dim"))
+            logger.debug("Tools table rendered (empty)")
+            return
+
+        table = Table(title="已注册工具", show_lines=False, border_style="cyan")
+        table.add_column("名称", style="bold cyan")
+        table.add_column("描述", overflow="fold")
+        table.add_column("参数", style="dim", overflow="fold")
+
+        for tool in tools:
+            desc = str(getattr(tool, "description", "") or "")
+            if len(desc) > 50:
+                desc = desc[:47] + "..."
+            table.add_row(
+                str(getattr(tool, "name", "unknown")),
+                desc,
+                self._format_tool_params(getattr(tool, "schema", None)),
+            )
+
+        self.console.print(table)
+        logger.info("Tools table rendered", extra={"count": len(tools)})
+
+    @staticmethod
+    def _format_tool_params(schema: dict | None) -> str:
+        """从 JSON Schema 提取参数名列表，必填参数加 ``*`` 后缀。
+
+        从 ``properties`` 取参数名、``required`` 取必填集合，
+        逗号连接后超长截断，供工具表格的「参数」列使用。
+        """
+        if not isinstance(schema, dict):
+            return "-"
+        properties = schema.get("properties") or {}
+        if not properties:
+            return "-"
+        required = set(schema.get("required") or [])
+        names = [f"{name}*" if name in required else name for name in properties]
+        params = ", ".join(names)
+        if len(params) > 40:
+            params = params[:37] + "..."
+        return params
+
+    def render_help_panel(self) -> None:
+        """渲染帮助信息为 Rich Panel（内置命令表 + 快捷键说明）。
+
+        在 ``/help`` 命令中使用，全中文内容：
+        - 上半部分为内置命令表（命令 / 说明两列）
+        - 下半部分为快捷键表（快捷键 / 说明两列）
+        外层 Panel 青色边框，title 为「帮助」。
+        """
+        # 内置命令表：box=None 去掉内部边框，保持 Panel 内紧凑排版
+        cmd_table = Table(show_header=True, header_style="bold cyan",
+                          box=None, padding=(0, 2))
+        cmd_table.add_column("命令", style="bold cyan")
+        cmd_table.add_column("说明")
+        cmd_table.add_row("/clear", "清空对话上下文")
+        cmd_table.add_row("/save", "保存当前会话")
+        cmd_table.add_row("/tools", "列出已注册工具")
+        cmd_table.add_row("/quit, /exit", "退出 REPL")
+        cmd_table.add_row("/help", "显示此帮助")
+
+        # 快捷键表
+        key_table = Table(show_header=True, header_style="bold cyan",
+                          box=None, padding=(0, 2))
+        key_table.add_column("快捷键", style="bold yellow")
+        key_table.add_column("说明")
+        key_table.add_row("Ctrl+C", "中断当前任务")
+        key_table.add_row("Ctrl+D", "退出 REPL")
+        key_table.add_row("Esc+Enter", "插入换行（多行输入）")
+
+        self.console.print(Panel(
+            Group(cmd_table, Text(""), key_table),
+            title="帮助",
+            title_align="left",
+            border_style="cyan",
+            padding=(0, 1),
+        ))
+        logger.debug("Help panel rendered")
 
     # ------------------------------------------------------------------
     # 信息输出

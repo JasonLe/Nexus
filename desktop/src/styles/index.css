@@ -1,0 +1,213 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-abyss-900 text-slate-200 font-sans antialiased;
+  overflow: hidden;
+}
+
+/* ---------- 氛围背景：极光 + 网格 + 噪点 ---------- */
+.atmosphere {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse 60% 45% at 12% -8%, rgba(46, 230, 174, 0.07), transparent 65%),
+    radial-gradient(ellipse 50% 40% at 88% 108%, rgba(124, 110, 168, 0.08), transparent 60%),
+    radial-gradient(ellipse 40% 32% at 70% -10%, rgba(46, 140, 230, 0.05), transparent 70%);
+}
+
+.atmosphere::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(148, 178, 220, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(148, 178, 220, 0.035) 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: radial-gradient(ellipse 90% 80% at 50% 40%, black 30%, transparent 100%);
+}
+
+.atmosphere::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  opacity: 0.05;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)' opacity='0.6'/%3E%3C/svg%3E");
+}
+
+/* ---------- 滚动条 ---------- */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(46, 230, 174, 0.22) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(46, 230, 174, 0.16);
+  border-radius: 8px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(46, 230, 174, 0.32);
+}
+
+/* ---------- 打字光标 ---------- */
+.type-cursor {
+  display: inline-block;
+  width: 8px;
+  height: 1.05em;
+  margin-left: 3px;
+  vertical-align: text-bottom;
+  border-radius: 1px;
+  background: #2ee6ae;
+  box-shadow: 0 0 8px rgba(46, 230, 174, 0.7);
+  animation: cursor-breathe 1.05s ease-in-out infinite;
+}
+.type-cursor.think {
+  background: #9a8cc7;
+  box-shadow: 0 0 8px rgba(154, 140, 199, 0.6);
+}
+@keyframes cursor-breathe {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scaleY(1);
+  }
+  50% {
+    opacity: 0.25;
+    transform: scaleY(0.82);
+  }
+}
+
+/* ---------- 运行状态呼吸点 ---------- */
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 6px currentColor;
+  }
+  50% {
+    opacity: 0.35;
+    box-shadow: 0 0 1px currentColor;
+  }
+}
+.pulse-dot {
+  animation: pulse-dot 1.6s ease-in-out infinite;
+}
+
+/* ---------- Markdown 渲染 ---------- */
+.md-body {
+  @apply text-[13.5px] leading-relaxed text-slate-300 break-words;
+}
+.md-body > *:first-child {
+  margin-top: 0;
+}
+.md-body > *:last-child {
+  margin-bottom: 0;
+}
+.md-body p {
+  @apply my-2.5;
+}
+.md-body h1,
+.md-body h2,
+.md-body h3,
+.md-body h4 {
+  @apply font-display text-slate-100 mt-5 mb-2 tracking-wide;
+}
+.md-body h1 {
+  @apply text-lg;
+}
+.md-body h2 {
+  @apply text-base;
+}
+.md-body h3 {
+  @apply text-[15px];
+}
+.md-body h4 {
+  @apply text-sm;
+}
+.md-body ul {
+  @apply my-2.5 pl-5 list-disc marker:text-neon-500/70;
+}
+.md-body ol {
+  @apply my-2.5 pl-5 list-decimal marker:text-neon-500/70;
+}
+.md-body li {
+  @apply my-1;
+}
+.md-body a {
+  @apply text-neon-400 underline decoration-neon-500/40 underline-offset-2 hover:decoration-neon-400;
+}
+.md-body strong {
+  @apply text-slate-100 font-semibold;
+}
+.md-body blockquote {
+  @apply my-3 border-l-2 border-neon-500/40 pl-3 text-slate-400 italic;
+}
+.md-body hr {
+  @apply my-4 border-abyss-600;
+}
+.md-body code:not(pre code) {
+  @apply font-mono text-[12px] px-1.5 py-0.5 rounded bg-abyss-700/70 text-neon-300 border border-abyss-600/60;
+}
+.md-body pre {
+  @apply my-3 rounded-lg border border-abyss-600/70 bg-abyss-950/90 p-3.5 overflow-x-auto;
+}
+.md-body pre code {
+  @apply font-mono text-[12.5px] leading-relaxed text-slate-300;
+}
+.md-body table {
+  @apply my-3 w-full border-collapse text-[12.5px];
+}
+.md-body th {
+  @apply border border-abyss-600/80 bg-abyss-750 px-3 py-1.5 text-left font-display text-slate-200 tracking-wide;
+}
+.md-body td {
+  @apply border border-abyss-600/60 px-3 py-1.5 align-top;
+}
+.md-body tr:nth-child(even) td {
+  @apply bg-abyss-850/60;
+}
+
+/* ---------- 通用小元素 ---------- */
+.panel {
+  @apply rounded-xl border border-abyss-600/60 bg-abyss-850/80 backdrop-blur-sm;
+}
+
+.section-label {
+  @apply font-display text-[11px] font-semibold uppercase tracking-[0.22em] text-slate-500;
+}
+
+.field-input {
+  @apply w-full rounded-lg border border-abyss-600/70 bg-abyss-950/80 px-3 py-2 text-[13px] text-slate-200
+    outline-none transition-colors placeholder:text-slate-600
+    focus:border-neon-500/60 focus:shadow-glow-neon;
+}
+
+.btn-primary {
+  @apply rounded-lg border border-neon-500/50 bg-neon-500/10 px-4 py-2 font-display text-[13px] font-semibold
+    tracking-wider text-neon-400 transition-all hover:bg-neon-500/20 hover:shadow-glow-neon
+    disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-neon-500/10 disabled:hover:shadow-none;
+}
+
+.btn-ghost {
+  @apply rounded-lg border border-abyss-600/70 px-4 py-2 font-display text-[13px] font-semibold tracking-wider
+    text-slate-400 transition-colors hover:border-slate-500/50 hover:text-slate-200;
+}

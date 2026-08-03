@@ -278,8 +278,9 @@ class Repl:
         """执行用户任务 —— 角色化展示 Agent 执行全过程。
 
         展示流程：
-        1. 渲染轮次分隔线 + AI 标签（🤖 Nexus）
-           （用户输入已由 prompt_toolkit 输入行显示，不重复渲染）
+        1. 渲染用户消息 Panel（👤 You，绿色边框）→ 轮次分隔线 →
+           AI 标签（🤖 Nexus），把用户输入固定在对话流中，
+           避免随 prompt 滚动消失后与 AI 输出混淆
         2. 立即启动思考链 Live（🤔 Thinking 标题），让用户在首个 chunk
            到达前就感知"正在思考"状态
         3. 执行 Agent.run()，事件回调驱动实时展示：
@@ -292,7 +293,8 @@ class Repl:
 
         事件处理器在 Agent.run() 之前订阅、之后取消，避免跨任务泄露。
         """
-        # 分隔线 + AI 标签（用户输入已由 prompt_toolkit 显示，不重复渲染）
+        # 用户消息 Panel → 分隔线 → AI 标签（顺序固定，形成角色化对话流）
+        self.display.render_user_message(user_input)
         self.display.render_divider()
         self.display.render_assistant_header()
 
@@ -565,27 +567,12 @@ class Repl:
             )
 
         elif command == "/tools":
-            # 列出已注册的工具
-            tools = list(self.agent.tool_registry)
-            if not tools:
-                self.display.show_info("（暂无已注册的工具）")
-            else:
-                for t in tools:
-                    desc = t.description[:60]
-                    print(f"  🔧 {t.name}: {desc}")
+            # 列出已注册的工具（Rich Table 渲染）
+            self.display.render_tools_table(list(self.agent.tool_registry))
 
         elif command == "/help":
-            # 显示帮助信息
-            print("  内置命令:")
-            print("    /clear  清空对话上下文")
-            print("    /save   保存当前会话")
-            print("    /tools  列出已注册工具")
-            print("    /quit   退出 REPL")
-            print("    /help   显示此帮助")
-            print("  ")
-            print("  直接输入问题或任务描述即可与 Agent 对话。")
-            print("  按 Ctrl+D 或输入 quit/exit 退出。")
-            print("  ")
+            # 显示帮助信息（Rich Panel 渲染）
+            self.display.render_help_panel()
 
         else:
             self.display.render_warning(

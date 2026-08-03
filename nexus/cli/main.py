@@ -195,6 +195,8 @@ def _run_single(agent: Agent, config: NexusConfig, prompt: str) -> None:
         from nexus.core.event.event_types import EventType
         from nexus.core.event.types import Event
 
+        # 与 repl.py 保持一致的渲染顺序：用户消息 Panel → 分隔线 → AI 标签
+        display.render_user_message(prompt)
         display.render_divider()
         display.render_assistant_header()
 
@@ -381,6 +383,11 @@ def main() -> None:
         _run_sessions_command(sys.argv[2:])
         return
 
+    # 早期派发：nexus serve / nexus ui（同理避免被 argparse 当成 prompt）
+    if len(sys.argv) > 1 and sys.argv[1] in ("serve", "ui"):
+        _run_server_command(sys.argv[1], sys.argv[2:])
+        return
+
     parser = argparse.ArgumentParser(
         prog="nexus",
         description="Nexus CLI Agent - 命令行编程助理",
@@ -488,6 +495,49 @@ def main() -> None:
                 print(f"Config saved to {saved_path}")
             except Exception as e:
                 logger.warning("Failed to save config: %s", e)
+
+
+# ------------------------------------------------------------------
+# nexus serve / nexus ui 子命令
+# ------------------------------------------------------------------
+
+
+def _run_server_command(command: str, argv: list[str]) -> None:
+    """``nexus serve`` / ``nexus ui`` 子命令派发器。
+
+    - ``nexus serve [--port N] [--host H]``：启动 HTTP + WebSocket 服务
+    - ``nexus ui [--port N] [--host H]``：启动服务后自动打开浏览器
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"nexus {command}",
+        description="启动 Nexus Server（HTTP + WebSocket 后端）",
+    )
+    parser.add_argument("--port", type=int, default=8321, help="监听端口（默认 8321）")
+    parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
+    args = parser.parse_args(argv)
+
+    # 依赖检查：fastapi/uvicorn 为可选依赖（pip install -e ".[server]"）
+    try:
+        import uvicorn  # noqa: F401
+        from nexus.server.app import create_app
+    except ImportError:
+        print(
+            "缺少 server 依赖，请运行 pip install -e \".[server]\" 后重试。"
+        )
+        return
+
+    app = create_app(work_dir=os.getcwd())
+
+    if command == "ui":
+        # 服务启动后自动打开浏览器（延迟 1 秒等待 uvicorn 就绪）
+        import threading
+        import webbrowser
+
+        url = f"http://127.0.0.1:{args.port}/"
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+
+    print(f"Nexus Server 启动中: http://{args.host}:{args.port}/")
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 # ------------------------------------------------------------------
