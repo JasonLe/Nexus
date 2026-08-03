@@ -72,7 +72,7 @@ class Agent:
     system_prompt : str or None
         系统提示词（可选），注入为 messages 的第一条 system 消息。
     max_steps : int
-        最大执行步数，默认 20 步。
+        最大执行步数，默认 30 步。
     name : str
         Agent 名称，用于日志和事件追踪。
     tool_registry : ToolRegistry
@@ -88,7 +88,7 @@ class Agent:
         llm: BaseLLM,
         policy: ExecutionPolicy | None = None,
         system_prompt: str | None = None,
-        max_steps: int = 20,
+        max_steps: int = 30,
         name: str = "nexus",
         stream: bool = True,
     ) -> None:
@@ -107,7 +107,7 @@ class Agent:
             在每次执行时一致。
         max_steps : int
             最大执行步数，传递给 default ReActPolicy 和 Runtime。
-            默认为 20 步，防止 LLM 无限循环调用工具。
+            默认为 30 步，防止 LLM 无限循环调用工具。
         name : str
             Agent 名称，用于日志和事件追踪。默认为 "nexus"。
         stream : bool

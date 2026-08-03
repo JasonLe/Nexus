@@ -63,7 +63,7 @@ class ReActPolicy(ExecutionPolicy):
     Policy 的 _step_count 仅用于决策逻辑（max_steps 判断）。
     """
 
-    def __init__(self, max_steps: int = 20) -> None:
+    def __init__(self, max_steps: int = 30) -> None:
         self.max_steps = max_steps
         self._step_count: int = 0
         # 缓存 LLM 本轮返回的待执行 tool_calls 队列。

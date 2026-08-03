@@ -410,6 +410,33 @@ class TestAutoTruncate:
         assert loaded is not None
         assert len(loaded.messages) == 3
 
+    def test_default_no_truncate(self, tmp_path):
+        """默认 auto_truncate=False 时，超长历史应全量保存不截断。"""
+        sm = SessionManager(sessions_dir=str(tmp_path))
+
+        # 创建 120 条非 system 消息（60 轮对话），超过默认 50 轮上限
+        messages = [{"role": "system", "content": "You are a helpful assistant."}]
+        for i in range(60):
+            messages.append({"role": "user", "content": f"question {i}"})
+            messages.append({"role": "assistant", "content": f"answer {i}"})
+
+        state = _make_state(task="long conversation", messages=messages)
+
+        # 不传 auto_truncate，使用默认值 False
+        session_id = sm.save(state)
+        loaded = sm.load(session_id)
+
+        assert loaded is not None
+        # 全量消息应被保留：1 system + 60 user + 60 assistant = 121
+        assert len(loaded.messages) == 121
+
+        # 最旧和最新的消息都应存在
+        contents = {m["content"] for m in loaded.messages}
+        assert "question 0" in contents
+        assert "answer 0" in contents
+        assert "question 59" in contents
+        assert "answer 59" in contents
+
 
 # ---------------------------------------------------------------------------
 # load_latest 测试

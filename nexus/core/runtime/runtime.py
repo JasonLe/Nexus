@@ -108,7 +108,7 @@ class Runtime:
         policy: ExecutionPolicy,
         initial_messages: list[dict[str, Any]] | None = None,
         variables: dict[str, Any] | None = None,
-        max_steps: int = 20,
+        max_steps: int = 30,
     ) -> AgentState:
         """启动 Agent 执行主循环。
 
@@ -130,7 +130,7 @@ class Runtime:
             运行时变量（可选），存入 state.variables，供 Policy 和插件使用。
         max_steps : int
             最大执行步数上限，写入 ExecutionContext 供 Policy 读取。
-            默认为 20 步，防止无限循环。
+            默认为 30 步，防止无限循环。
 
         Returns
         -------

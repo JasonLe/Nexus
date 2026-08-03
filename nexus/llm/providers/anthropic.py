@@ -91,12 +91,17 @@ class AnthropicLLM(BaseLLM):
     _env_key: str = "ANTHROPIC_API_KEY"
     _default_model: str = "claude-sonnet-4-20250514"
     _default_base_url: str | None = None  # None = 使用 SDK 默认
+    # 默认 thinking 配置。None 表示不启用（原生 Anthropic 调用方需自行传 thinking）。
+    # 兼容 Anthropic API 的服务（如 MiniMax）可覆写为 {"type": "adaptive"} 或
+    # {"type": "enabled", "budget_tokens": N} 以启用思考链。
+    _default_thinking: dict[str, Any] | None = None
 
     def __init__(
         self,
         api_key: str | None = None,
         base_url: str | None = None,
         model: str | None = None,
+        thinking: dict[str, Any] | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = 3,
         context_window_tokens: int = 0,
@@ -107,6 +112,10 @@ class AnthropicLLM(BaseLLM):
         self._timeout = timeout
         self._max_retries = max_retries
         self.context_window_tokens = context_window_tokens
+        # thinking 配置：显式传入 > 类默认值 > None（关闭）
+        self._thinking: dict[str, Any] | None = (
+            thinking if thinking is not None else self._default_thinking
+        )
 
         # api_key 读取顺序：显式传入 > 环境变量
         resolved_key = api_key or os.getenv(self._env_key)
@@ -199,6 +208,8 @@ class AnthropicLLM(BaseLLM):
         if tools:
             params["tools"] = self._convert_tools_to_anthropic(tools)
 
+        self._apply_thinking(params, kwargs)
+
         params.update(kwargs)
 
         async def _do_call() -> Any:
@@ -261,6 +272,8 @@ class AnthropicLLM(BaseLLM):
 
             if tools:
                 params["tools"] = self._convert_tools_to_anthropic(tools)
+
+            self._apply_thinking(params, kwargs)
 
             params.update(kwargs)
 
@@ -451,15 +464,41 @@ class AnthropicLLM(BaseLLM):
 
         return system_prompt, anthropic_messages
 
+    def _apply_thinking(self, params: dict[str, Any], kwargs: dict[str, Any]) -> None:
+        """将实例默认的 thinking 配置注入到 SDK 调用参数。
+
+        优先级：
+        1. 调用方 kwargs 中的 ``thinking`` —— 最高优先级
+        2. ``self._thinking``（来自构造函数或 ``_default_thinking`` 类属性）
+        3. 不注入 —— 即保持 SDK 默认行为
+
+        ``kwargs`` 仅用于检查是否已存在 ``thinking`` 键，不会被修改。
+        实际透传由调用方在 ``params.update(kwargs)`` 阶段完成。
+        """
+        if "thinking" not in kwargs and self._thinking is not None:
+            params["thinking"] = self._thinking
+
     @staticmethod
     def _parse_response(response: Any) -> LLMResponse:
-        """将 Anthropic SDK Message 响应转换为 Nexus LLMResponse。"""
+        """将 Anthropic SDK Message 响应转换为 Nexus LLMResponse。
+
+        同时聚合 content block 与 thinking block（若启用 extended thinking）：
+        - text block → ``content``
+        - thinking block → ``reasoning_content``（用于非流式回退路径展示思考链）
+        - tool_use block → ``tool_calls``
+        """
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_calls: list[ToolCall] = []
 
         for block in response.content:
             if block.type == "text":
                 content_parts.append(block.text)
+            elif block.type == "thinking":
+                # Anthropic extended thinking / MiniMax adaptive thinking block
+                thinking_text = getattr(block, "thinking", "") or ""
+                if thinking_text:
+                    reasoning_parts.append(thinking_text)
             elif block.type == "tool_use":
                 tool_calls.append(ToolCall(
                     id=block.id,
@@ -479,6 +518,7 @@ class AnthropicLLM(BaseLLM):
 
         return LLMResponse(
             content="\n".join(content_parts),
+            reasoning_content="\n".join(reasoning_parts),
             tool_calls=tool_calls,
             usage=usage,
             model=response.model,

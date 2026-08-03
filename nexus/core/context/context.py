@@ -45,6 +45,6 @@ class ExecutionContext:
     llm: Any  # BaseLLM 实例（避免循环导入，使用 Any 类型标注）
     tool_executor: "ToolExecutor"
     events: "EventBus"
-    max_steps: int = 20
+    max_steps: int = 30
     variables: dict[str, Any] = field(default_factory=dict)
     memory: Any = None  # BaseMemory 实例（预留）
