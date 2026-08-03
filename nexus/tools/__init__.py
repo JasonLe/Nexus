@@ -17,15 +17,27 @@ from nexus.tools.base import (
 )
 from nexus.tools.decorators import tool
 from nexus.tools.executor import ToolExecutor
+from nexus.tools.file_tools import (
+    ListDirTool,
+    ReadFileTool,
+    SearchContentTool,
+    WriteFileTool,
+)
 from nexus.tools.registry import ToolRegistry
+from nexus.tools.shell_tool import ShellTool
 
 __all__ = [
     "BaseTool",
     "tool",
     "ToolError",
     "ToolExecutor",
+    "ListDirTool",
     "ToolNotFoundError",
     "ToolRegistry",
     "ToolResult",
     "ToolValidationError",
+    "ReadFileTool",
+    "SearchContentTool",
+    "ShellTool",
+    "WriteFileTool",
 ]

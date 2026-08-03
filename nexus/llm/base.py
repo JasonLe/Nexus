@@ -83,6 +83,10 @@ class LLMResponse:
     ----------
     content : str
         模型生成的文本内容。当触发 tool_calls 时可能为空。
+    reasoning_content : str
+        思考链内容（适用于支持 thinking 的 provider，如 Anthropic Claude extended thinking、
+        MiniMax adaptive thinking 等）。非流式回退路径下从响应中聚合 thinking block；
+        流式路径通常为空（已在 LLMChunk.delta_reasoning 中实时返回）。
     tool_calls : list[ToolCall]
         模型请求执行的工具调用列表。
     usage : UsageStats
@@ -100,6 +104,7 @@ class LLMResponse:
     """
 
     content: str = ""
+    reasoning_content: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     usage: UsageStats = field(default_factory=UsageStats)
     model: str = ""

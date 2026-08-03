@@ -153,13 +153,13 @@ def _register_tools(agent: Agent, config: NexusConfig) -> None:
     否则仅注册 enabled 中列出的工具。
     """
     try:
-        from nexus.cli.tools.file_tools import (
+        from nexus.tools.file_tools import (
             ReadFileTool,
             WriteFileTool,
             ListDirTool,
             SearchContentTool,
         )
-        from nexus.cli.tools.shell_tool import ShellTool
+        from nexus.tools.shell_tool import ShellTool
         all_tools = {
             "read_file": ReadFileTool(work_dir=config.work_dir or os.getcwd()),
             "write_file": WriteFileTool(work_dir=config.work_dir or os.getcwd()),
@@ -200,46 +200,56 @@ def _run_single(agent: Agent, config: NexusConfig, prompt: str) -> None:
 
         tool_count = 0
 
-        # 流式状态（每轮 LLM 调用重置）：thinking/response 的 Live 实例与累积文本
+        # 流式状态（每轮 LLM 调用重置）
+        # thinking 和 response 都用纯 append 模式，完全不使用 Live/Status：
+        # - 无光标控制序列 → 滚动绝对安全
+        # - thinking 增量 print（dim italic），response 按段落渲染 Markdown
+        # - 不用 Panel 边框（Panel 需一次性渲染，与流式 append 冲突）
         stream_state: dict[str, Any] = {
-            "thinking_live": None,
-            "response_live": None,
+            "thinking_started": False,
+            "response_started": False,
             "thinking_acc": "",
             "response_acc": "",
         }
 
         async def on_llm_chunk(event: Event) -> None:
-            """LLM chunk 到达：增量渲染思考链或回复。"""
+            """LLM chunk 到达：增量打印思考链与回复。
+
+            thinking 用 append 模式直接 print（dim italic），首个 reasoning
+            到达时先打印 🤔 Thinking 标题。response 用段落缓冲渲染 Markdown。
+            两者均不使用 Live，不发送光标控制序列，滚动绝对安全。
+            """
             delta_content = event.payload.get("delta_content", "")
             delta_reasoning = event.payload.get("delta_reasoning", "")
 
             if delta_reasoning:
-                if stream_state["thinking_live"] is None:
-                    stream_state["thinking_live"] = display.start_streaming_thinking()
+                # 首个 reasoning chunk → 打印 Thinking 标题
+                if not stream_state["thinking_started"]:
+                    display.print_thinking_start()
+                    stream_state["thinking_started"] = True
                 stream_state["thinking_acc"] += delta_reasoning
-                display.update_streaming_thinking(
-                    stream_state["thinking_live"], stream_state["thinking_acc"])
+                display.print_thinking_chunk(delta_reasoning)
 
             if delta_content:
-                # thinking 结束后切换到 response：关闭 thinking Live
-                if stream_state["thinking_live"] is not None:
-                    stream_state["thinking_live"].stop()
-                    stream_state["thinking_live"] = None
-                if stream_state["response_live"] is None:
-                    stream_state["response_live"] = display.start_streaming_response()
+                # thinking 结束 → 换行收尾
+                if stream_state["thinking_started"]:
+                    display.end_thinking_stream()
+                    stream_state["thinking_started"] = False
+                # response：append 模式按段落渲染 Markdown
                 stream_state["response_acc"] += delta_content
-                display.update_streaming_response(
-                    stream_state["response_live"], stream_state["response_acc"])
+                display.print_response_chunk(delta_content)
+                stream_state["response_started"] = True
 
         async def on_after_llm(event) -> None:
-            """LLM 调用后：关闭流式 Live，统计 token，避免重复渲染。"""
-            # 关闭可能未关闭的 Live 实例
-            if stream_state["thinking_live"] is not None:
-                stream_state["thinking_live"].stop()
-                stream_state["thinking_live"] = None
-            if stream_state["response_live"] is not None:
-                stream_state["response_live"].stop()
-                stream_state["response_live"] = None
+            """LLM 调用后：收尾流式状态，统计 token。"""
+            # thinking 收尾（兜底纯 thinking 无 content 场景）
+            if stream_state["thinking_started"]:
+                display.end_thinking_stream()
+                stream_state["thinking_started"] = False
+            # response 收尾换行
+            if stream_state["response_started"]:
+                display.end_response_stream()
+                stream_state["response_started"] = False
 
             payload = event.payload
             response = payload.get("response")
@@ -258,6 +268,14 @@ def _run_single(agent: Agent, config: NexusConfig, prompt: str) -> None:
             # 重置流式累积状态（为下一轮 LLM 调用准备）
             stream_state["thinking_acc"] = ""
             stream_state["response_acc"] = ""
+
+        async def on_before_llm(event) -> None:
+            """LLM 调用前：无需操作（append 模式无需预创建 Live）。
+
+            thinking 标题在首个 reasoning chunk 到达时由 on_llm_chunk 打印，
+            此处保持空实现以兼容 ReAct 多轮循环的事件订阅。
+            """
+            pass
 
         async def on_before_tool(event) -> None:
             nonlocal tool_count
@@ -281,15 +299,33 @@ def _run_single(agent: Agent, config: NexusConfig, prompt: str) -> None:
                 )
 
         await agent.events.subscribe(EventType.AFTER_LLM_CALL, on_after_llm)
+        await agent.events.subscribe(EventType.BEFORE_LLM_CALL, on_before_llm)
         await agent.events.subscribe(EventType.LLM_CHUNK, on_llm_chunk)
         await agent.events.subscribe(EventType.BEFORE_TOOL_CALL, on_before_tool)
         await agent.events.subscribe(EventType.AFTER_TOOL_CALL, on_after_tool)
 
         try:
-            # 流式模式下不使用 spinner：spinner 与 Rich Live 共享终端刷新会冲突
             await agent.run(prompt)
+        except Exception as e:
+            # 兜底收尾流式状态
+            if stream_state["thinking_started"]:
+                display.end_thinking_stream()
+                stream_state["thinking_started"] = False
+            if stream_state["response_started"]:
+                display.end_response_stream()
+                stream_state["response_started"] = False
+            display.render_error(f"执行错误: {e}")
+            logger.error("Single run failed", exc_info=True)
         finally:
+            # 兜底收尾（异常路径下 except 已处理，正常路径下 on_after_llm 已处理）
+            if stream_state["thinking_started"]:
+                display.end_thinking_stream()
+                stream_state["thinking_started"] = False
+            if stream_state["response_started"]:
+                display.end_response_stream()
+                stream_state["response_started"] = False
             await agent.events.unsubscribe(EventType.AFTER_LLM_CALL, on_after_llm)
+            await agent.events.unsubscribe(EventType.BEFORE_LLM_CALL, on_before_llm)
             await agent.events.unsubscribe(EventType.LLM_CHUNK, on_llm_chunk)
             await agent.events.unsubscribe(EventType.BEFORE_TOOL_CALL, on_before_tool)
             await agent.events.unsubscribe(EventType.AFTER_TOOL_CALL, on_after_tool)

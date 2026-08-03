@@ -278,23 +278,21 @@ class Repl:
         """执行用户任务 —— 角色化展示 Agent 执行全过程。
 
         展示流程：
-        1. 渲染用户消息 Panel（绿色边框，👤 You 标签）
-        2. 渲染轮次分隔线 + AI 标签（🤖 Nexus）
-        3. 执行 Agent.run()，事件回调驱动实时展示（流式模式不使用 spinner，
-           避免与 Rich Live 终端刷新冲突）：
-           - LLM_CHUNK：增量渲染思考链（dim italic Live）与回复（Markdown Live）
+        1. 渲染轮次分隔线 + AI 标签（🤖 Nexus）
+           （用户输入已由 prompt_toolkit 输入行显示，不重复渲染）
+        2. 立即启动思考链 Live（🤔 Thinking 标题），让用户在首个 chunk
+           到达前就感知"正在思考"状态
+        3. 执行 Agent.run()，事件回调驱动实时展示：
+           - LLM_CHUNK：增量渲染思考链（dim italic Panel）与回复（Markdown Live）
            - AFTER_LLM_CALL：关闭流式 Live、统计 token；
              非流式回退时一次性渲染思考链或回复
            - AFTER_TOOL_CALL：渲染工具调用 Panel（青色/红色边框）
-           - ON_ERROR：渲染错误 Panel（红色边框）
+           - ON_ERROR：关闭 Live、渲染错误 Panel（红色边框）
         4. 维护跨轮对话历史
 
         事件处理器在 Agent.run() 之前订阅、之后取消，避免跨任务泄露。
         """
-        # 渲染用户消息到对话流
-        self.display.render_user_message(user_input)
-
-        # 分隔线 + AI 标签
+        # 分隔线 + AI 标签（用户输入已由 prompt_toolkit 显示，不重复渲染）
         self.display.render_divider()
         self.display.render_assistant_header()
 
@@ -302,58 +300,62 @@ class Repl:
         token_usage: dict[str, int] = {"prompt": 0, "completion": 0, "total": 0}
         finish_event: asyncio.Event = asyncio.Event()
 
-        # 流式状态（每轮 LLM 调用重置）：thinking/response 的 Live 实例与累积文本
+        # 流式状态（每轮 LLM 调用重置）
+        # thinking 和 response 都用纯 append 模式，完全不使用 Live/Status：
+        # - 无光标控制序列 → 滚动绝对安全
+        # - thinking 增量 print（dim italic），response 按段落渲染 Markdown
+        # - 不用 Panel 边框（Panel 需一次性渲染，与流式 append 冲突）
         stream_state: dict[str, Any] = {
-            "thinking_live": None,
-            "response_live": None,
+            "thinking_started": False,
+            "response_started": False,
             "thinking_acc": "",
             "response_acc": "",
         }
 
         async def on_llm_chunk(event: Event) -> None:
-            """LLM chunk 到达：增量渲染思考链或回复。
+            """LLM chunk 到达：增量打印思考链与回复。
 
-            根据 chunk 的 delta_reasoning / delta_content 字段分别驱动
-            thinking 与 response 的 Live 实例。思考链先于回复出现，
-            收到首个 delta_content 时关闭 thinking Live 并切换到 response。
+            thinking 用 append 模式直接 print（dim italic），首个 reasoning
+            到达时先打印 🤔 Thinking 标题。response 用段落缓冲渲染 Markdown。
+            两者均不使用 Live，不发送光标控制序列，滚动绝对安全。
             """
             delta_content = event.payload.get("delta_content", "")
             delta_reasoning = event.payload.get("delta_reasoning", "")
 
             if delta_reasoning:
-                if stream_state["thinking_live"] is None:
-                    stream_state["thinking_live"] = self.display.start_streaming_thinking()
+                # 首个 reasoning chunk → 打印 Thinking 标题
+                if not stream_state["thinking_started"]:
+                    self.display.print_thinking_start()
+                    stream_state["thinking_started"] = True
                 stream_state["thinking_acc"] += delta_reasoning
-                self.display.update_streaming_thinking(
-                    stream_state["thinking_live"], stream_state["thinking_acc"])
+                self.display.print_thinking_chunk(delta_reasoning)
 
             if delta_content:
-                # thinking 结束后切换到 response：关闭 thinking Live
-                if stream_state["thinking_live"] is not None:
-                    stream_state["thinking_live"].stop()
-                    stream_state["thinking_live"] = None
-                if stream_state["response_live"] is None:
-                    stream_state["response_live"] = self.display.start_streaming_response()
+                # thinking 结束 → 换行收尾
+                if stream_state["thinking_started"]:
+                    self.display.end_thinking_stream()
+                    stream_state["thinking_started"] = False
+                # response：append 模式按段落渲染 Markdown
                 stream_state["response_acc"] += delta_content
-                self.display.update_streaming_response(
-                    stream_state["response_live"], stream_state["response_acc"])
+                self.display.print_response_chunk(delta_content)
+                stream_state["response_started"] = True
 
         async def on_after_llm(event: Event) -> None:
-            """LLM 调用后：关闭流式 Live，统计 token，避免重复渲染。
+            """LLM 调用后：收尾流式状态，统计 token。
 
             流式路径下内容已通过 LLM_CHUNK 事件增量渲染完毕，
-            此处仅做收尾（关闭 Live、统计 token）。
+            此处仅做收尾（thinking/response 换行收尾、统计 token）。
             非流式路径下（stream=False）response_acc 为空，
             仍走一次性渲染逻辑。
             """
-            # 关闭可能未关闭的 Live 实例（thinking 收到 content 时已关闭，
-            # 但若纯 thinking 无 content 则需在此兜底关闭）
-            if stream_state["thinking_live"] is not None:
-                stream_state["thinking_live"].stop()
-                stream_state["thinking_live"] = None
-            if stream_state["response_live"] is not None:
-                stream_state["response_live"].stop()
-                stream_state["response_live"] = None
+            # thinking 收尾（兜底纯 thinking 无 content 场景）
+            if stream_state["thinking_started"]:
+                self.display.end_thinking_stream()
+                stream_state["thinking_started"] = False
+            # response 收尾换行
+            if stream_state["response_started"]:
+                self.display.end_response_stream()
+                stream_state["response_started"] = False
 
             response = event.payload.get("response")
             usage = event.payload.get("usage")
@@ -375,6 +377,14 @@ class Repl:
             # 重置流式累积状态（为下一轮 LLM 调用准备）
             stream_state["thinking_acc"] = ""
             stream_state["response_acc"] = ""
+
+        async def on_before_llm(event: Event) -> None:
+            """LLM 调用前：无需操作（append 模式无需预创建 Live）。
+
+            thinking 标题在首个 reasoning chunk 到达时由 on_llm_chunk 打印，
+            此处保持空实现以兼容 ReAct 多轮循环的事件订阅。
+            """
+            pass
 
         async def on_before_tool(event: Event) -> None:
             """工具调用前：累加计数器（spinner 已显示工作状态，无需额外打印）。"""
@@ -408,7 +418,13 @@ class Repl:
                 )
 
         async def on_error(event: Event) -> None:
-            """运行时错误：展示错误信息。"""
+            """运行时错误：收尾流式状态并展示错误信息。"""
+            if stream_state["thinking_started"]:
+                self.display.end_thinking_stream()
+                stream_state["thinking_started"] = False
+            if stream_state["response_started"]:
+                self.display.end_response_stream()
+                stream_state["response_started"] = False
             error_info = event.payload.get("error")
             self.display.render_error(f"执行错误: {error_info}")
 
@@ -417,6 +433,7 @@ class Repl:
             finish_event.set()
 
         await self.agent.events.subscribe(EventType.AFTER_LLM_CALL, on_after_llm)
+        await self.agent.events.subscribe(EventType.BEFORE_LLM_CALL, on_before_llm)
         await self.agent.events.subscribe(EventType.LLM_CHUNK, on_llm_chunk)
         await self.agent.events.subscribe(EventType.BEFORE_TOOL_CALL, on_before_tool)
         await self.agent.events.subscribe(EventType.AFTER_TOOL_CALL, on_after_tool)
@@ -432,10 +449,17 @@ class Repl:
                 ),
             )
 
-            self._conversation_history.append({"role": "user", "content": user_input})
-            for msg in state.messages:
-                if msg.get("role") == "assistant":
-                    self._conversation_history.append(msg)
+            # 用 state.messages（含完整 user/assistant/tool）替换历史，
+            # 跳过 system 消息（由 agent.run 重新注入）。
+            # 这样 tool 角色消息得以保留，使 assistant 的 tool_calls 有对应结果。
+            #
+            # 重要：必须保留 ``role=="tool"`` 消息（带 ``tool_call_id`` 字段），
+            # 否则下一轮 ``AnthropicLLM._split_system_messages`` 无法将 tool result
+            # 转换为 Anthropic 的 tool_result blocks，assistant 的 tool_calls
+            # 链路会断裂 —— 当前 test_cli_session.py 与 test_runtime.py 已覆盖。
+            self._conversation_history = [
+                msg for msg in state.messages if msg.get("role") != "system"
+            ]
 
             try:
                 await asyncio.wait_for(finish_event.wait(), timeout=5.0)
@@ -452,11 +476,19 @@ class Repl:
             )
 
         except Exception as e:
+            # 兜底收尾流式状态
+            if stream_state["thinking_started"]:
+                self.display.end_thinking_stream()
+                stream_state["thinking_started"] = False
+            if stream_state["response_started"]:
+                self.display.end_response_stream()
+                stream_state["response_started"] = False
             self.display.render_error(f"执行错误: {e}")
             logger.error("Task execution failed", exc_info=True)
 
         finally:
             await self.agent.events.unsubscribe(EventType.AFTER_LLM_CALL, on_after_llm)
+            await self.agent.events.unsubscribe(EventType.BEFORE_LLM_CALL, on_before_llm)
             await self.agent.events.unsubscribe(EventType.LLM_CHUNK, on_llm_chunk)
             await self.agent.events.unsubscribe(EventType.BEFORE_TOOL_CALL, on_before_tool)
             await self.agent.events.unsubscribe(EventType.AFTER_TOOL_CALL, on_after_tool)

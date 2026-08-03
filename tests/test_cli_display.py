@@ -100,6 +100,60 @@ class TestDisplayThinking:
         output = _get_output(display)
         assert len(output) == 0
 
+    def test_streaming_thinking_panel_title(self, display):
+        """流式思考链应以 Panel 包裹并显示 🤔 Thinking 标题。"""
+        from rich.panel import Panel
+
+        live = display.start_streaming_thinking()
+        try:
+            # start 即应渲染 Panel，标题含 🤔 Thinking
+            buf = io.StringIO()
+            Console(file=buf, force_terminal=True, width=120).print(live.renderable)
+            assert "Thinking" in buf.getvalue()
+
+            # update 后仍为 Panel，且包含累积内容
+            display.update_streaming_thinking(live, "analyzing the code structure")
+            buf2 = io.StringIO()
+            Console(file=buf2, force_terminal=True, width=120).print(live.renderable)
+            out2 = buf2.getvalue()
+            assert "Thinking" in out2
+            assert "analyzing" in out2
+        finally:
+            live.stop()
+
+    def test_streaming_thinking_loading_state(self, display):
+        """流式思考链空内容时应显示 loading 状态（Spinner）。"""
+        from rich.spinner import Spinner
+
+        live = display.start_streaming_thinking()
+        try:
+            # 初始渲染对象应包含 Spinner（loading 动画）
+            buf = io.StringIO()
+            Console(file=buf, force_terminal=True, width=120).print(live.renderable)
+            assert "Thinking" in buf.getvalue()
+            # Spinner 默认包含 "Thinking" 文本提示
+            assert "Thinking" in buf.getvalue()
+
+            # 空字符串 update 后仍保持 Spinner（不报错）
+            display.update_streaming_thinking(live, "   ")
+            buf2 = io.StringIO()
+            Console(file=buf2, force_terminal=True, width=120).print(live.renderable)
+            assert "Thinking" in buf2.getvalue()
+        finally:
+            live.stop()
+
+    def test_show_thinking_status(self, display):
+        """show_thinking_status 返回 Rich Status 实例，stop 后无副作用。"""
+        from rich.status import Status
+
+        status = display.show_thinking_status()
+        try:
+            assert isinstance(status, Status)
+        finally:
+            status.stop()
+        # 多次 stop 不报错
+        status.stop()
+
 
 class TestDisplayToolCall:
     """测试工具调用渲染。"""

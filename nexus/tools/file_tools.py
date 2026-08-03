@@ -129,7 +129,7 @@ class ReadFileTool(BaseTool):
     DEFAULT_MAX_LINES = 500
 
     # 尝试的编码列表（按优先级）
-    _ENCODINGS = ("utf-8", "latin-1", "cp1252", "gbk")
+    _ENCODINGS = ("utf-8", "gbk", "latin-1", "cp1252")
 
     def __init__(self, work_dir: str = ".") -> None:
         """初始化 ReadFileTool。
@@ -808,7 +808,7 @@ def register_all_tools(agent_or_registry: Agent | ToolRegistry) -> None:
     --------
 
     >>> from nexus.core.agent.agent import Agent
-    >>> from nexus.cli.tools.file_tools import register_all_tools
+    >>> from nexus.tools.file_tools import register_all_tools
     >>>
     >>> agent = Agent(llm=my_llm)
     >>> register_all_tools(agent)

@@ -83,7 +83,7 @@ class SessionManager:
         self,
         state: AgentState,
         metadata: dict[str, Any] | None = None,
-        auto_truncate: bool = True,
+        auto_truncate: bool = False,
         session_id: str | None = None,
         log_file: str | None = None,
     ) -> str:
@@ -100,7 +100,14 @@ class SessionManager:
             额外元数据（如任务描述、用户标签），会一并写入会话文件。
         auto_truncate : bool
             是否在持久化前自动截断过长历史（保留最近 50 轮）。
-            默认开启，防止会话文件膨胀。
+            默认关闭，存储全量对话；设为 True 时截断以控制文件体积。
+
+            .. note::
+                **破坏性变更**：早期版本（<2026-08）默认 ``True``。
+                现在默认 ``False`` 以保留 user/assistant/tool 全量消息，
+                避免 assistant 的 ``tool_calls`` 失去对应的 tool result。
+                如需恢复截断行为（如文件体积敏感场景），显式传
+                ``auto_truncate=True``。
         session_id : str | None
             显式指定会话 ID（用于覆盖同一会话文件）。
             None 时生成新 uuid（保持向后兼容）。

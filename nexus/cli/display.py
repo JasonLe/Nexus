@@ -20,11 +20,12 @@ from __future__ import annotations
 import time
 from typing import AsyncIterator
 
-from rich.console import Console
+from rich.console import Console, Group, RenderableType
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.spinner import Spinner
+from rich.status import Status
 from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
@@ -32,6 +33,10 @@ from rich.tree import Tree
 from nexus.logging import get_logger
 
 logger = get_logger(__name__)
+
+# 模块级共享 Spinner 实例：Thinking box 共用同一对象，确保动画帧时间戳
+# 连续，避免每次 update 重建对象导致 spinner 帧抖动。
+_THINKING_SPINNER = Spinner("dots", text="Thinking...", style="dim")
 
 
 class DisplayManager:
@@ -64,13 +69,41 @@ class DisplayManager:
         """初始化显示管理器。
 
         创建 Rich Console 实例并记录启动时间，用于后续统计总耗时。
+        ``_response_buffer`` 用于流式回复按段落累积渲染 Markdown：
+        chunk 到达时累积到 buffer，遇到段落分隔（连续两个换行）则
+        把整段用 Markdown 渲染后 append 输出，既滚动安全又美观。
         """
         self.console = Console()
         self._start_time = time.time()
+        self._response_buffer: str = ""
 
     # ------------------------------------------------------------------
     # 欢迎 / 告别
     # ------------------------------------------------------------------
+
+    def show_thinking_status(self) -> Status:
+        """显示"正在思考"状态指示器（底部 spinner）。
+
+        使用 Rich 的 ``console.status()`` 上下文管理器：在屏幕底部
+        显示一个 spinner + "Thinking..." 文本，不占用固定行数。
+        reasoning 内容在 LLM 调用完成后由调用方用 ``render_thinking``
+        一次性渲染到终端（不在 spinner 期间实时显示）。
+
+        设计原因：thinking 实时渲染（Live）会导致 ReAct 多轮循环中
+        多个 Thinking Panel 叠加显示。改用 status spinner 完全规避
+        Live 重叠问题，且仍能给用户"正在思考"的视觉反馈。
+
+        Returns
+        -------
+        Status
+            Rich Status 上下文管理器实例，调用方需用 ``.stop()`` 关闭。
+        """
+        status = self.console.status(
+            "[dim]🤔 Thinking...[/dim]",
+            spinner="dots",
+        )
+        status.start()
+        return status
 
     def show_welcome(self) -> None:
         """显示欢迎信息。
@@ -160,8 +193,17 @@ class DisplayManager:
     def start_streaming_thinking(self) -> Live:
         """开启思考链流式渲染，返回 Live 实例供后续更新。
 
-        使用灰色 dim italic 样式渲染思考链增量内容，
-        与正式回复形成明确的视觉层次区分（思考过程低权重）。
+        使用 Panel 包裹 Spinner + Text（Group 组合）：
+        - 思考内容为空时显示 Spinner 加载动画
+        - 有内容时在 Spinner 下方追加具体思考文本（dim italic）
+
+        标题 🤔 Thinking，灰色边框，与非流式 ``render_thinking`` 样式一致。
+        流式开始即显示 loading 状态，让用户在首个思考 chunk 到达前
+        就能感知"正在思考"。
+
+        关键设计：``transient=True``，Live stop 时自动擦除整个渲染区域，
+        避免 ReAct 多轮循环中多个 Thinking Panel 堆叠。调用方在 stop 后
+        应调用 ``render_thinking(accumulated)`` 把最终内容固化为非 Live Panel。
 
         Returns
         -------
@@ -170,18 +212,29 @@ class DisplayManager:
             调用 ``update_streaming_thinking`` 更新内容，
             流结束后调用 ``live.stop()`` 关闭。
         """
+        panel = Panel(
+            self._thinking_content(""),
+            title="🤔 Thinking",
+            title_align="left",
+            border_style="dim",
+            padding=(0, 1),
+        )
         live = Live(
-            Text("", style="dim italic"),
+            panel,
             console=self.console,
             refresh_per_second=10,
             vertical_overflow="visible",
-            transient=False,
+            transient=True,
         )
         live.start()
         return live
 
     def update_streaming_thinking(self, live: Live, accumulated: str) -> None:
         """更新思考链累积内容。
+
+        内容为空时显示 Spinner 加载动画，有内容时在 Spinner 下方
+        追加具体思考文本。每次更新重建 Panel，保持"🤔 Thinking"标题
+        和灰色边框常驻，内容区随累积文本增量刷新。
 
         Parameters
         ----------
@@ -190,7 +243,31 @@ class DisplayManager:
         accumulated : str
             当前累积的思考链全文（非增量），由调用方维护拼接。
         """
-        live.update(Text(accumulated, style="dim italic"))
+        panel = Panel(
+            self._thinking_content(accumulated),
+            title="🤔 Thinking",
+            title_align="left",
+            border_style="dim",
+            padding=(0, 1),
+        )
+        live.update(panel)
+
+    def _thinking_content(self, accumulated: str) -> RenderableType:
+        """构建 Thinking box 的内部内容。
+
+        始终在顶部保留 Spinner（loading 状态指示），
+        内容为空时只显示 Spinner，有内容时在 Spinner 下方
+        追加具体思考文本（dim italic）。使用 Group 垂直组合。
+
+        Spinner 复用模块级常量 ``_THINKING_SPINNER``，保持帧时间戳连续。
+        """
+        if not accumulated.strip():
+            return _THINKING_SPINNER
+        return Group(
+            _THINKING_SPINNER,
+            Text("", style="dim"),
+            Text(accumulated, style="dim italic"),
+        )
 
     def start_streaming_response(self) -> Live:
         """开启回复流式渲染，返回 Live 实例。
@@ -226,6 +303,56 @@ class DisplayManager:
             当前累积的回复全文（非增量），由调用方维护拼接。
         """
         live.update(Markdown(accumulated))
+
+    def print_response_chunk(self, chunk: str) -> None:
+        """以 append 模式打印回复增量文本，按段落渲染 Markdown（滚动安全）。
+
+        采用"段落缓冲"策略平衡美观与滚动安全：
+        - chunk 到达时累积到 ``_response_buffer``
+        - 遇到段落分隔（``\\n\\n``）时，把整段用 Markdown 渲染后 append 输出
+        - 未结束的段落保留在 buffer 中，等下个 chunk 或 ``end_response_stream``
+
+        代码块（``` ... ```）保护：若 buffer 中存在未闭合的 ``` 标记，
+        暂不分段输出，避免代码块被拆分导致渲染异常，直到代码块闭合。
+
+        设计原因：
+        - Live 重绘模式：滚动时光标定位错乱导致内容错乱（已弃用）
+        - 纯 append 原始文本：滚动安全但 Markdown 语法裸露，不美观
+        - 段落缓冲：完整段落以 Markdown 渲染（好看），append 输出无光标
+          控制序列（滚动安全），未完成段落暂存 buffer 不输出
+
+        Parameters
+        ----------
+        chunk : str
+            本次到达的增量文本（非累积全文）。
+        """
+        if not chunk:
+            return
+        self._response_buffer += chunk
+        # 代码块保护：若存在未闭合的 ```，暂不分段
+        if self._response_buffer.count("```") % 2 == 1:
+            return
+        # 按段落分隔（双换行）拆分：最后一段可能是未完成的，保留在 buffer
+        while "\n\n" in self._response_buffer:
+            para, self._response_buffer = self._response_buffer.split("\n\n", 1)
+            para = para.strip()
+            if para:
+                self.console.print(Markdown(para), end="\n\n", soft_wrap=True)
+                self.console.file.flush()
+
+    def end_response_stream(self) -> None:
+        """流式回复结束：渲染剩余缓冲区内容并打印换行收尾。
+
+        将 buffer 中未结束的段落用 Markdown 渲染输出，
+        然后打印换行确保后续内容（Tool/Thinking）从新行开始。
+        """
+        # 输出 buffer 中剩余的未完成段落
+        remaining = self._response_buffer.strip()
+        if remaining:
+            self.console.print(Markdown(remaining), soft_wrap=True)
+            self.console.file.flush()
+        self._response_buffer = ""
+        self.console.print()
 
     # ------------------------------------------------------------------
     # 工具调用展示
@@ -361,6 +488,35 @@ class DisplayManager:
         ))
         logger.debug("Thinking rendered", extra={"text_length": len(text)})
 
+    def print_thinking_start(self) -> None:
+        """流式思考开始：打印 🤔 Thinking 标题（静态，无 spinner）。
+
+        纯 append 模式，不使用 Live/Status，不发送任何光标控制序列，
+        滚动绝对安全。思考内容通过 ``print_thinking_chunk`` 增量追加。
+
+        设计原因：Live（transient=True）在 stop 时发送光标控制序列
+        擦除内容，用户滚动终端后光标定位错乱，导致擦除失败、旧内容
+        残留 + render_thinking 重复打印 = 多次输出。改用纯 append
+        彻底消除光标控制序列。
+        """
+        self.console.print("[dim]🤔 Thinking[/dim]")
+
+    def print_thinking_chunk(self, chunk: str) -> None:
+        """流式打印思考内容（dim italic，append 模式，滚动安全）。
+
+        Parameters
+        ----------
+        chunk : str
+            本次到达的增量思考文本。
+        """
+        if chunk:
+            self.console.print(chunk, style="dim italic", end="", soft_wrap=True)
+            self.console.file.flush()
+
+    def end_thinking_stream(self) -> None:
+        """流式思考结束：打印换行收尾。"""
+        self.console.print()
+
     # ------------------------------------------------------------------
     # 错误 / 警告展示
     # ------------------------------------------------------------------
@@ -391,7 +547,7 @@ class DisplayManager:
         """
         warning_text = Text(message, style="yellow")
         self.console.print(Panel(warning_text, border_style="yellow", title="Warning"))
-        logger.warning("Warning rendered to console", extra={"message": message[:100]})
+        logger.warning("Warning rendered to console", extra={"warning_text": message[:100]})
 
     # ------------------------------------------------------------------
     # 执行摘要统计

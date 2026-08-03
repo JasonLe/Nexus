@@ -18,7 +18,7 @@ import shlex
 import sys
 import tempfile
 
-from nexus.cli.tools.shell_tool import ShellTool
+from nexus.tools.shell_tool import ShellTool
 from nexus.tools.registry import ToolRegistry
 from nexus.tools.executor import ToolExecutor
 

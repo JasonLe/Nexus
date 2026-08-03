@@ -11,7 +11,7 @@
 
 import pytest
 
-from nexus.cli.tools.file_tools import (
+from nexus.tools.file_tools import (
     ReadFileTool,
     WriteFileTool,
     ListDirTool,
