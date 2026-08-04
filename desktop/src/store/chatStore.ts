@@ -127,6 +127,12 @@ export const useChatStore = create<ChatState>((set, get) => {
           })
         }
         set({ running: false })
+        // 刷新会话列表，使新会话自动出现在左侧
+        void get().loadSessions()
+        // 若后端返回了 session_id，标记为当前活跃会话
+        if ('session_id' in msg && msg.session_id) {
+          set({ activeSessionId: msg.session_id })
+        }
         break
       case 'error':
         if (last && last.role === 'assistant' && last.streaming) {

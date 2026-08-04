@@ -92,7 +92,7 @@ export type WsServerMessage =
       index: number
     }
   | ({ type: 'usage' } & UsageInfo)
-  | { type: 'done'; steps: number; usage: UsageInfo }
+  | { type: 'done'; steps: number; usage: UsageInfo; session_id?: string }
   | { type: 'error'; message: string }
   | { type: 'reset_ok' }
   | { type: 'restore_ok'; message_count: number }

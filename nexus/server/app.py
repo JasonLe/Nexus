@@ -204,6 +204,8 @@ class _ChatConnection:
 
         if msg_type == "reset":
             self.history = []
+            # 重置时生成新的 session_id，避免覆盖上一个会话
+            self.session_id = str(uuid.uuid4())[:_SESSION_ID_LENGTH]
             await self.ws.send_json({"type": "reset_ok"})
 
         elif msg_type == "restore":
@@ -452,6 +454,28 @@ def create_app(
         except Exception as e:
             logger.warning("Failed to save config: %s", e)
             raise HTTPException(status_code=500, detail=f"配置保存失败: {e}")
+
+        # 重建 LLM + Agent，使新配置（provider / model / api_key 等）立即生效
+        try:
+            new_llm = _create_llm(cfg)
+            new_agent = Agent(
+                llm=new_llm,
+                system_prompt=cfg.system_prompt,
+                max_steps=cfg.max_steps,
+                stream=cfg.stream,
+            )
+            _register_tools(new_agent, cfg)
+            request.app.state.config = cfg
+            request.app.state.agent = new_agent
+            logger.info(
+                "Config saved & agent rebuilt: provider=%s, model=%s",
+                cfg.default_provider,
+                cfg.model,
+            )
+        except Exception as e:
+            logger.warning("Failed to rebuild agent after config save: %s", e)
+            # 配置已落盘，但运行时实例未更新；下次重启会加载新配置
+
         return JSONResponse(_config_to_json(cfg))
 
     @app.get("/api/sessions")
