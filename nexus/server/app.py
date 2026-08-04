@@ -211,6 +211,10 @@ class _ChatConnection:
         elif msg_type == "restore":
             messages = data.get("messages") or []
             self.history = [m for m in messages if isinstance(m, dict)]
+            # 恢复指定会话：用前端传来的 session_id 覆盖，使后续保存写到原会话文件
+            session_id = data.get("session_id")
+            if isinstance(session_id, str) and session_id:
+                self.session_id = session_id
             await self.ws.send_json(
                 {"type": "restore_ok", "message_count": len(self.history)}
             )
@@ -385,7 +389,7 @@ def create_app(
     config : NexusConfig | None
         注入的配置实例（测试用）。None 时调用 load_config() 加载。
     llm : BaseLLM | None
-        注入的 LLM 实例（测试用 mock）。None 时由 _create_llm 工厂创建。
+        注入的 LLM 实例（测试用 mock）。None 时由 nexus.core.factory 创建。
     agent : Agent | None
         注入的 Agent 实例。None 时基于 llm + config 创建并注册工具。
     session_manager : SessionManager | None
@@ -399,24 +403,25 @@ def create_app(
     FastAPI
         组装完成的应用实例。
     """
-    # 延迟导入避免 server 依赖污染 CLI-only 环境
-    from nexus.cli.main import _create_llm, _register_tools
-
     work_dir = work_dir or os.getcwd()
 
     if config is None:
         config = load_config(work_dir=work_dir)
         config.work_dir = work_dir
     if agent is None:
-        if llm is None:
-            llm = _create_llm(config)
-        agent = Agent(
-            llm=llm,
-            system_prompt=config.system_prompt,
-            max_steps=config.max_steps,
-            stream=config.stream,
-        )
-        _register_tools(agent, config)
+        if llm is not None:
+            # 测试注入 LLM 场景：用传入的 llm 构造 Agent，再注册工具
+            agent = Agent(
+                llm=llm,
+                system_prompt=config.system_prompt,
+                max_steps=config.max_steps,
+                stream=config.stream,
+            )
+            from nexus.core.factory import register_tools
+            register_tools(agent, config)
+        else:
+            from nexus.core.factory import create_agent
+            agent = create_agent(config)
     if session_manager is None:
         session_manager = SessionManager()
 
@@ -455,16 +460,10 @@ def create_app(
             logger.warning("Failed to save config: %s", e)
             raise HTTPException(status_code=500, detail=f"配置保存失败: {e}")
 
-        # 重建 LLM + Agent，使新配置（provider / model / api_key 等）立即生效
+        # 重建 Agent，使新配置（provider / model / api_key 等）立即生效
         try:
-            new_llm = _create_llm(cfg)
-            new_agent = Agent(
-                llm=new_llm,
-                system_prompt=cfg.system_prompt,
-                max_steps=cfg.max_steps,
-                stream=cfg.stream,
-            )
-            _register_tools(new_agent, cfg)
+            from nexus.core.factory import create_agent
+            new_agent = create_agent(cfg)
             request.app.state.config = cfg
             request.app.state.agent = new_agent
             logger.info(

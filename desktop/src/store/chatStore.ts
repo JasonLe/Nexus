@@ -250,7 +250,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           error: null,
           historical: true,
         }))
-        socket?.send({ type: 'restore', messages: history })
+        socket?.send({ type: 'restore', messages: history, session_id: id })
         set({ messages: restored, activeSessionId: id })
         toast('success', `已恢复会话（${restored.length} 条消息）`)
       } catch (e) {

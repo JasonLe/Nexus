@@ -528,7 +528,7 @@ class Repl:
 
         elif command == "/clear":
             # 重新创建 Agent（保留 LLM、Policy、配置和工具）
-            from nexus.cli.main import _register_tools
+            from nexus.core.factory import register_tools
 
             original_agent = self.agent
             new_agent = Agent(
@@ -541,7 +541,7 @@ class Repl:
                 name=original_agent.name,
             )
             # 根据配置文件重新注册工具
-            _register_tools(new_agent, self.config)
+            register_tools(new_agent, self.config)
             self.agent = new_agent
             self._conversation_history.clear()
             self.display.show_info("上下文已清空，工具已重新注册")

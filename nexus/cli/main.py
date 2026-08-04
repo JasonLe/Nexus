@@ -107,74 +107,15 @@ def setup_logging(
 
 
 def _create_llm(config: NexusConfig) -> BaseLLM:
-    """根据 config 创建对应的 LLM 实例。
-
-    Provider 工厂模式——根据 config.default_provider 动态选择，
-    传入 config.provider_config 中的 api_key、model、base_url、
-    context_window_tokens、timeout、max_retries。
-    """
-    provider = config.default_provider.lower()
-    pc = config.provider_config
-
-    # 公共参数：超时、重试、context window
-    common_kwargs = {
-        "context_window_tokens": pc.context_window_tokens,
-    }
-
-    if provider == "minimax":
-        from nexus.llm.providers.minimax import MiniMaxAnthropicLLM
-        return MiniMaxAnthropicLLM(
-            api_key=pc.api_key,
-            model=pc.model or "MiniMax-Text-01",
-            base_url=pc.base_url or "https://api.minimaxi.com/anthropic",
-            **common_kwargs,
-        )
-    elif provider == "anthropic":
-        from nexus.llm.providers.anthropic import AnthropicLLM
-        return AnthropicLLM(
-            api_key=pc.api_key,
-            model=pc.model or "claude-sonnet-4-20250514",
-            **({"base_url": pc.base_url} if pc.base_url else {}),
-            **common_kwargs,
-        )
-    else:
-        return OpenAILLM(
-            api_key=pc.api_key,
-            base_url=pc.base_url,
-            model=pc.model or "gpt-4o-mini",
-            **common_kwargs,
-        )
+    """根据 config 创建对应的 LLM 实例（薄包装，委托给 nexus.core.factory）。"""
+    from nexus.core.factory import create_llm
+    return create_llm(config)
 
 
 def _register_tools(agent: Agent, config: NexusConfig) -> None:
-    """根据 config.tools.enabled 注册工具。
-
-    如果 config.tools.enabled 为空列表 → 注册所有内置工具（默认行为）。
-    否则仅注册 enabled 中列出的工具。
-    """
-    try:
-        from nexus.tools.file_tools import (
-            ReadFileTool,
-            WriteFileTool,
-            ListDirTool,
-            SearchContentTool,
-        )
-        from nexus.tools.shell_tool import ShellTool
-        all_tools = {
-            "read_file": ReadFileTool(work_dir=config.work_dir or os.getcwd()),
-            "write_file": WriteFileTool(work_dir=config.work_dir or os.getcwd()),
-            "list_dir": ListDirTool(),
-            "search_content": SearchContentTool(),
-            "shell": ShellTool(work_dir=config.work_dir or os.getcwd()),
-        }
-        enabled = set(config.tools.enabled) if config.tools.enabled else set(all_tools.keys())
-
-        for name, tool in all_tools.items():
-            if name in enabled:
-                agent.register_tool(tool)
-                logger.debug("Tool registered: %s", name)
-    except ImportError:
-        logger.debug("File tools not available")
+    """根据 config.tools.enabled 注册工具（薄包装，委托给 nexus.core.factory）。"""
+    from nexus.core.factory import register_tools
+    register_tools(agent, config)
 
 
 def _run_single(agent: Agent, config: NexusConfig, prompt: str) -> None:
@@ -461,16 +402,9 @@ def main() -> None:
     config = load_config(cli_args, work_dir=work_dir)
     config.work_dir = work_dir
 
-    # 创建 LLM + Agent
-    llm = _create_llm(config)
-    agent = Agent(
-        llm=llm,
-        system_prompt=config.system_prompt,
-        max_steps=config.max_steps,
-    )
-
-    # 注册工具（根据配置文件过滤）
-    _register_tools(agent, config)
+    # 创建 Agent（通过核心工厂模块，与 server / repl 共享同一组装逻辑）
+    from nexus.core.factory import create_agent
+    agent = create_agent(config)
 
     # 派发
     try:
@@ -712,13 +646,8 @@ def _sessions_restore(
     new_run_id = str(uuid.uuid4())[:8]
     new_log_file = setup_logging(session_id=new_run_id)
 
-    llm = _create_llm(config)
-    agent = Agent(
-        llm=llm,
-        system_prompt=config.system_prompt,
-        max_steps=config.max_steps,
-    )
-    _register_tools(agent, config)
+    from nexus.core.factory import create_agent
+    agent = create_agent(config)
 
     display.show_welcome()
     repl = Repl(

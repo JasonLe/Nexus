@@ -71,7 +71,7 @@ export interface ToolInfo {
 export type WsClientMessage =
   | { type: 'message'; content: string }
   | { type: 'reset' }
-  | { type: 'restore'; messages: HistoryMessage[] }
+  | { type: 'restore'; messages: HistoryMessage[]; session_id?: string }
 
 export interface UsageInfo {
   prompt_tokens: number
