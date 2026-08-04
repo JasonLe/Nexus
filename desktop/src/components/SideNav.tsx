@@ -4,7 +4,7 @@ import { useAppStore, type ViewKey } from '../store/appStore'
 const NAV_ITEMS: Array<{ key: ViewKey; label: string; icon: string }> = [
   { key: 'chat', label: '会话', icon: '◈' },
   { key: 'config', label: '配置', icon: '◉' },
-  { key: 'tools', label: '工具', icon: '⬡' },
+  { key: 'tools', label: '工具', icon: '' },
 ]
 
 export function SideNav() {

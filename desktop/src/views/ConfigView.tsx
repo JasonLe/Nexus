@@ -99,6 +99,7 @@ export function ConfigView() {
 
   function isToolEnabled(name: string): boolean {
     if (!config) return false
+    if (config.tools.enabled.includes('__none__')) return false  // 全部禁用
     return config.tools.enabled.length === 0 || config.tools.enabled.includes(name)
   }
 
@@ -107,7 +108,10 @@ export function ConfigView() {
       if (!c) return c
       const allNames = tools.map((t) => t.name)
       let next: string[]
-      if (c.tools.enabled.length === 0) {
+      if (c.tools.enabled.includes('__none__')) {
+        // 当前为「全部禁用」，从中恢复一个
+        next = enabled ? [name] : ['__none__']
+      } else if (c.tools.enabled.length === 0) {
         // 当前为「全部启用」，从中移除 / 保持
         next = enabled ? [] : allNames.filter((n) => n !== name)
       } else if (enabled) {
@@ -350,6 +354,8 @@ export function ConfigView() {
               <span className="font-mono text-[10.5px] text-slate-500">
                 {allEnabled
                   ? 'enabled = []（不限制）'
+                  : config.tools.enabled.includes('__none__')
+                  ? '全部禁用'
                   : `已启用 ${config.tools.enabled.filter((n) => tools.some((t) => t.name === n)).length} 项`}
               </span>
             </div>

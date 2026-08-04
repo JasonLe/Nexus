@@ -186,12 +186,27 @@ function createWindow() {
     backgroundColor: '#0a0e14',
     autoHideMenuBar: true,
     show: !SMOKE_MODE, // 冒烟模式不展示窗口（兼容无显示器环境）
+    // 完全自定义标题栏（macOS 交通灯固定在左侧，改用 frame:false 实现自定义按钮）
+    frame: false,
     webPreferences: {
       // 安全基线：渲染进程仅通过 HTTP/WS 与后端交互，不暴露任何 Node 能力
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true,
+      sandbox: false, // preload 需要 require('electron')，sandbox 模式下不可用
+      preload: path.join(__dirname, 'preload.cjs'),
     },
+  });
+
+  // IPC handlers for window controls
+  const { ipcMain } = require('electron');
+  ipcMain.on('window:minimize', () => {
+    mainWindow?.minimize();
+  });
+  ipcMain.on('window:close', () => {
+    mainWindow?.close();
+  });
+  ipcMain.handle('window:get-platform', () => {
+    return process.platform;
   });
 
   // 加载策略：开发模式走 Vite dev server，生产模式由 FastAPI 托管 desktop/dist

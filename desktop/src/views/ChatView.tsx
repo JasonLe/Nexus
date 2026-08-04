@@ -3,10 +3,11 @@ import { useChatStore } from '../store/chatStore'
 import { MessageItem } from '../components/MessageItem'
 import { ChatInput } from '../components/ChatInput'
 import { SessionPanel } from '../components/SessionPanel'
+import { LogDrawer } from '../components/LogDrawer'
 
 function EmptyState() {
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
+    <div className="flex min-h-[calc(100vh-8rem)] flex-col items-center justify-center gap-3 text-center">
       <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-neon-500/40 bg-neon-500/[0.06] font-display text-2xl font-bold text-neon-400 shadow-glow-neon">
         N
       </div>
@@ -39,7 +40,7 @@ export function ChatView() {
   }
 
   return (
-    <div className="flex h-full min-w-0 flex-1">
+    <div className="relative flex h-full min-w-0 flex-1">
       {/* 历史会话侧栏 */}
       <aside className="hidden w-60 shrink-0 border-r border-abyss-600/60 bg-abyss-850/40 pt-3 md:block">
         <SessionPanel />
@@ -58,6 +59,9 @@ export function ChatView() {
         </div>
         <ChatInput />
       </div>
+
+      {/* 日志抽屉 */}
+      <LogDrawer />
     </div>
   )
 }

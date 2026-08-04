@@ -27,6 +27,16 @@ export interface ChatMessage {
   historical: boolean
 }
 
+export type LogEntryType = 'llm' | 'tool' | 'event' | 'error'
+
+export interface LogEntry {
+  id: string
+  timestamp: number
+  type: LogEntryType
+  label: string
+  content: string
+}
+
 interface ChatState {
   messages: ChatMessage[]
   wsStatus: WsStatus
@@ -34,6 +44,8 @@ interface ChatState {
   sessions: SessionSummary[]
   sessionsLoading: boolean
   activeSessionId: string | null
+  logs: LogEntry[]
+  clearLogs: () => void
   init: () => void
   send: (content: string) => void
   newSession: () => void
@@ -77,20 +89,36 @@ export const useChatStore = create<ChatState>((set, get) => {
     return msgs.length > 0 ? msgs[msgs.length - 1] : undefined
   }
 
+  let logSeq = 0
+  function addLog(type: LogEntryType, label: string, content: string): void {
+    logSeq += 1
+    const entry: LogEntry = {
+      id: `log-${Date.now()}-${logSeq}`,
+      timestamp: Date.now(),
+      type,
+      label,
+      content,
+    }
+    set((s) => ({ logs: [...s.logs, entry] }))
+  }
+
   function handleWsMessage(msg: WsServerMessage): void {
     const last = currentAssistant()
     switch (msg.type) {
       case 'thinking_delta':
+        addLog('llm', 'thinking', msg.delta)
         if (last && last.role === 'assistant' && last.streaming) {
           patchAssistant(last.id, { thinking: last.thinking + msg.delta })
         }
         break
       case 'content_delta':
+        addLog('llm', 'content', msg.delta)
         if (last && last.role === 'assistant' && last.streaming) {
           patchAssistant(last.id, { content: last.content + msg.delta })
         }
         break
       case 'tool_call':
+        addLog('tool', msg.name, JSON.stringify(msg.args))
         if (last && last.role === 'assistant' && last.streaming) {
           patchAssistant(last.id, {
             toolCalls: [
@@ -108,6 +136,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         }
         break
       case 'usage':
+        addLog('event', 'usage', `${msg.total_tokens} tokens`)
         if (last && last.role === 'assistant' && last.streaming) {
           patchAssistant(last.id, {
             usage: {
@@ -119,6 +148,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         }
         break
       case 'done':
+        addLog('event', 'done', `steps=${msg.steps}, tokens=${msg.usage?.total_tokens ?? 0}`)
         if (last && last.role === 'assistant' && last.streaming) {
           patchAssistant(last.id, {
             streaming: false,
@@ -135,6 +165,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         }
         break
       case 'error':
+        addLog('error', 'error', msg.message)
         if (last && last.role === 'assistant' && last.streaming) {
           patchAssistant(last.id, { streaming: false, error: msg.message })
         } else {
@@ -160,13 +191,19 @@ export const useChatStore = create<ChatState>((set, get) => {
       .map((m) => ({ role: m.role, content: m.content }))
   }
 
-  return {
+ return {
     messages: [],
     wsStatus: 'connecting',
     running: false,
     sessions: [],
     sessionsLoading: false,
     activeSessionId: null,
+    logs: [],
+
+    clearLogs: () => {
+      logSeq = 0
+      set({ logs: [] })
+    },
 
     init: () => {
       if (socket) return
@@ -213,7 +250,8 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     newSession: () => {
       socket?.send({ type: 'reset' })
-      set({ messages: [], running: false, activeSessionId: null })
+      logSeq = 0
+      set({ messages: [], running: false, activeSessionId: null, logs: [] })
     },
 
     loadSessions: async () => {
@@ -251,7 +289,8 @@ export const useChatStore = create<ChatState>((set, get) => {
           historical: true,
         }))
         socket?.send({ type: 'restore', messages: history, session_id: id })
-        set({ messages: restored, activeSessionId: id })
+        logSeq = 0
+        set({ messages: restored, activeSessionId: id, logs: [] })
         toast('success', `已恢复会话（${restored.length} 条消息）`)
       } catch (e) {
         toast('error', `恢复会话失败：${e instanceof Error ? e.message : String(e)}`)

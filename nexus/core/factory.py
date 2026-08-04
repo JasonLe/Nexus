@@ -81,7 +81,9 @@ def create_llm(config: NexusConfig) -> BaseLLM:
 def register_tools(agent: Agent, config: NexusConfig) -> None:
     """根据 config.tools.enabled 注册工具。
 
-    如果 config.tools.enabled 为空列表 → 注册所有内置工具（默认行为）。
+    特殊值：
+    - enabled 为空列表 → 注册所有内置工具（默认行为）
+    - enabled 为 ['__none__'] → 不注册任何工具（全部禁用）
     否则仅注册 enabled 中列出的工具。
 
     Parameters
@@ -106,6 +108,13 @@ def register_tools(agent: Agent, config: NexusConfig) -> None:
             "search_content": SearchContentTool(),
             "shell": ShellTool(work_dir=config.work_dir or os.getcwd()),
         }
+
+        # 处理哨兵值
+        if config.tools.enabled == ['__none__']:
+            # 全部禁用，不注册任何工具
+            logger.debug("All tools disabled")
+            return
+
         enabled = set(config.tools.enabled) if config.tools.enabled else set(all_tools.keys())
 
         for name, tool in all_tools.items():

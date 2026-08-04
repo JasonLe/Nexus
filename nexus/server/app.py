@@ -184,15 +184,26 @@ class _ChatConnection:
     """
 
     def __init__(
-        self, ws: WebSocket, agent: Agent, session_manager: SessionManager
+        self, ws: WebSocket, agent: Agent, session_manager: SessionManager, app: FastAPI | None = None
     ) -> None:
         self.ws = ws
-        self.agent = agent
+        self.agent = agent  # 初始 agent（连接建立时）
         self.session_manager = session_manager
+        self.app = app  # 用于动态获取最新 agent（配置变更后）
         # 8 位会话 ID（uuid4 前缀），贯穿连接生命周期，用于覆盖式保存
         self.session_id: str = str(uuid.uuid4())[:_SESSION_ID_LENGTH]
         self.history: list[dict[str, Any]] = []
         self._run_task: asyncio.Task | None = None
+
+    @property
+    def current_agent(self) -> Agent:
+        """获取当前 agent（优先从 app.state 获取最新版本）。"""
+        if self.app is not None:
+            try:
+                return self.app.state.agent
+            except Exception:
+                pass
+        return self.agent
 
     @property
     def running(self) -> bool:
@@ -325,14 +336,15 @@ class _ChatConnection:
             error_info = event.payload.get("error")
             await send({"type": "error", "message": f"执行错误: {error_info}"})
 
-        events = self.agent.events
+        agent = self.current_agent
+        events = agent.events
         await events.subscribe(EventType.LLM_CHUNK, on_llm_chunk)
         await events.subscribe(EventType.AFTER_LLM_CALL, on_after_llm)
         await events.subscribe(EventType.AFTER_TOOL_CALL, on_after_tool)
         await events.subscribe(EventType.ON_ERROR, on_error)
 
         try:
-            state = await self.agent.run(
+            state = await agent.run(
                 content,
                 initial_messages=self.history or None,
             )
@@ -502,14 +514,30 @@ def create_app(
 
     @app.get("/api/tools")
     async def list_tools(request: Request) -> list[dict[str, Any]]:
-        ag: Agent = request.app.state.agent
+        """返回所有可用工具（不管是否启用）。"""
+        from nexus.tools.file_tools import (
+            ReadFileTool,
+            WriteFileTool,
+            ListDirTool,
+            SearchContentTool,
+        )
+        from nexus.tools.shell_tool import ShellTool
+
+        cfg: NexusConfig = request.app.state.config
+        all_tools = {
+            "read_file": ReadFileTool(work_dir=cfg.work_dir or os.getcwd()),
+            "write_file": WriteFileTool(work_dir=cfg.work_dir or os.getcwd()),
+            "list_dir": ListDirTool(),
+            "search_content": SearchContentTool(),
+            "shell": ShellTool(work_dir=cfg.work_dir or os.getcwd()),
+        }
         return [
             {
-                "name": tool.name,
+                "name": name,
                 "description": tool.description,
                 "schema": tool.schema,
             }
-            for tool in ag.tool_registry.list()
+            for name, tool in all_tools.items()
         ]
 
     # ---------------- WebSocket 聊天 ----------------
@@ -518,7 +546,7 @@ def create_app(
     async def ws_chat(ws: WebSocket) -> None:
         await ws.accept()
         conn = _ChatConnection(
-            ws, ws.app.state.agent, ws.app.state.session_manager
+            ws, ws.app.state.agent, ws.app.state.session_manager, ws.app
         )
         try:
             while True:

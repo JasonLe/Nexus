@@ -3,7 +3,7 @@ import { AnimatePresence, motion } from 'framer-motion'
 import { useAppStore } from './store/appStore'
 import { useChatStore } from './store/chatStore'
 import { SideNav } from './components/SideNav'
-import { TopBar } from './components/TopBar'
+import { TitleBar } from './components/TitleBar'
 import { Toasts } from './components/Toasts'
 import { ChatView } from './views/ChatView'
 import { ConfigView } from './views/ConfigView'
@@ -24,7 +24,7 @@ export default function App() {
   return (
     <div className="relative flex h-full flex-col">
       <div className="atmosphere" />
-      <TopBar />
+      <TitleBar />
       <div className="relative z-10 flex min-h-0 flex-1">
         <SideNav />
         <main className="flex min-w-0 flex-1 flex-col">

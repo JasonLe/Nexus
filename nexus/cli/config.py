@@ -558,9 +558,8 @@ def save_config(config: NexusConfig, path: str | None = None) -> str:
         "max_steps": config.agent.max_steps,
     }
 
-    # tools
-    if config.tools.enabled:
-        data["tools"] = {"enabled": config.tools.enabled}
+    # tools — 始终保存（包括 enabled=[] 表示全部启用、['__none__'] 表示全部禁用）
+    data["tools"] = {"enabled": list(config.tools.enabled)}
 
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(
