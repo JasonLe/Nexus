@@ -230,6 +230,10 @@ class _ChatConnection:
                 {"type": "restore_ok", "message_count": len(self.history)}
             )
 
+        elif msg_type == "slash_command":
+            command = str(data.get("command", "")).lower().strip()
+            await self._handle_slash_command(command)
+
         elif msg_type == "message":
             if self.running:
                 await self.ws.send_json(
@@ -273,6 +277,81 @@ class _ChatConnection:
             )
         except Exception:
             logger.warning("Failed to save desktop session", exc_info=True)
+
+    async def _handle_slash_command(self, command: str) -> None:
+        """处理斜杠命令，返回结果给前端。
+
+        支持的命令：
+        /tools  - 列出已注册的工具
+        /clear  - 清空对话上下文
+        /help   - 显示帮助信息
+        /sessions - 列出历史会话
+        """
+        if command == "/tools":
+            agent = self.current_agent
+            tools = list(agent.tool_registry.list())
+            tool_list = [
+                {"name": t.name, "description": t.description}
+                for t in tools
+            ]
+            await self.ws.send_json({
+                "type": "slash_command_result",
+                "command": "/tools",
+                "title": "已注册工具",
+                "content": tool_list,
+            })
+
+        elif command == "/clear":
+            self.history = []
+            self.session_id = str(uuid.uuid4())[:_SESSION_ID_LENGTH]
+            await self.ws.send_json({
+                "type": "slash_command_result",
+                "command": "/clear",
+                "title": "上下文已清空",
+                "content": "对话历史已清除，可以开始新的对话。",
+            })
+
+        elif command == "/help":
+            help_text = (
+                "**可用命令：**\n\n"
+                "- `/tools` — 列出当前已注册的工具\n"
+                "- `/clear` — 清空对话上下文\n"
+                "- `/help` — 显示此帮助信息\n"
+                "- `/sessions` — 列出历史会话\n\n"
+                "直接输入文本即可与 Nexus Agent 对话。"
+            )
+            await self.ws.send_json({
+                "type": "slash_command_result",
+                "command": "/help",
+                "title": "帮助",
+                "content": help_text,
+            })
+
+        elif command == "/sessions":
+            sessions = self.session_manager.list_sessions()
+            session_list = [
+                {
+                    "id": s.get("id", ""),
+                    "summary": s.get("summary", ""),
+                    "timestamp": s.get("timestamp", ""),
+                    "message_count": s.get("message_count", 0),
+                }
+                for s in sessions[:20]  # 最多显示 20 条
+            ]
+            await self.ws.send_json({
+                "type": "slash_command_result",
+                "command": "/sessions",
+                "title": "历史会话",
+                "content": session_list,
+            })
+
+        else:
+            await self.ws.send_json({
+                "type": "slash_command_result",
+                "command": command,
+                "title": "未知命令",
+                "content": f"未知命令: {command}，输入 /help 查看帮助",
+            })
 
     async def _run(self, content: str) -> None:
         """执行一轮 Agent.run，期间订阅 EventBus 推送流式事件。

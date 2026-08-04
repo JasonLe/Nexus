@@ -180,8 +180,8 @@ function waitForBackend(timeoutMs) {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1440,
-    height: 900,
+    width: 1100,
+    height: 720,
     title: 'Nexus Desktop',
     backgroundColor: '#0a0e14',
     autoHideMenuBar: true,

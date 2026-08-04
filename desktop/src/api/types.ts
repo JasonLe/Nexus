@@ -72,6 +72,7 @@ export type WsClientMessage =
   | { type: 'message'; content: string }
   | { type: 'reset' }
   | { type: 'restore'; messages: HistoryMessage[]; session_id?: string }
+  | { type: 'slash_command'; command: string }
 
 export interface UsageInfo {
   prompt_tokens: number
@@ -96,3 +97,4 @@ export type WsServerMessage =
   | { type: 'error'; message: string }
   | { type: 'reset_ok' }
   | { type: 'restore_ok'; message_count: number }
+  | { type: 'slash_command_result'; command: string; title: string; content: unknown }

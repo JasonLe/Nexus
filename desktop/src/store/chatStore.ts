@@ -48,6 +48,7 @@ interface ChatState {
   clearLogs: () => void
   init: () => void
   send: (content: string) => void
+  sendSlashCommand: (command: string) => void
   newSession: () => void
   loadSessions: () => Promise<void>
   restoreSession: (id: string) => Promise<void>
@@ -181,6 +182,39 @@ export const useChatStore = create<ChatState>((set, get) => {
       case 'reset_ok':
       case 'restore_ok':
         break
+      case 'slash_command_result':
+        addLog('event', msg.command, msg.title)
+        // 添加一条系统消息显示命令结果
+        set((s) => ({
+          messages: [
+            ...s.messages,
+            {
+              id: nextMsgId(),
+              role: 'assistant' as const,
+              content: `**${msg.title}**\n\n${
+                Array.isArray(msg.content)
+                  ? msg.content.map((item: any) => {
+                      if (item.name && item.description) {
+                        return `- **${item.name}**: ${item.description}`
+                      }
+                      if (item.summary) {
+                        return `- ${item.summary} (${item.message_count} 条消息)`
+                      }
+                      return String(item)
+                    }).join('\n')
+                  : String(msg.content)
+              }`,
+              thinking: '',
+              toolCalls: [],
+              usage: null,
+              steps: null,
+              streaming: false,
+              error: null,
+              historical: false,
+            },
+          ],
+        }))
+        break
     }
   }
 
@@ -245,6 +279,33 @@ export const useChatStore = create<ChatState>((set, get) => {
       if (!ok) {
         set({ running: false })
         toast('error', '消息发送失败：连接已断开')
+      }
+    },
+
+    sendSlashCommand: (command: string) => {
+      if (!socket || !socket.ready) {
+        toast('error', '连接尚未建立，请稍候重试')
+        return
+      }
+      const userMsg: ChatMessage = {
+        id: nextMsgId(),
+        role: 'user',
+        content: command,
+        thinking: '',
+        toolCalls: [],
+        usage: null,
+        steps: null,
+        streaming: false,
+        error: null,
+        historical: false,
+      }
+      set((s) => ({
+        messages: [...s.messages, userMsg],
+      }))
+      addLog('event', 'command', command)
+      const ok = socket.send({ type: 'slash_command', command })
+      if (!ok) {
+        toast('error', '命令发送失败：连接已断开')
       }
     },
 
