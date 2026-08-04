@@ -179,6 +179,11 @@ function waitForBackend(timeoutMs) {
 // ---------------- 窗口 ----------------
 
 function createWindow() {
+  // 平台判断：titleBarOverlay 仅 Windows 支持；macOS 用 hidden 保留交通灯；
+  // Linux 保持 default 原生标题栏（hidden 会导致没有任何窗口按钮）
+  const isWin = process.platform === 'win32';
+  const isMac = process.platform === 'darwin';
+
   mainWindow = new BrowserWindow({
     width: 1100,
     height: 720,
@@ -186,8 +191,13 @@ function createWindow() {
     backgroundColor: '#0a0e14',
     autoHideMenuBar: true,
     show: !SMOKE_MODE, // 冒烟模式不展示窗口（兼容无显示器环境）
-    // 完全自定义标题栏（macOS 交通灯固定在左侧，改用 frame:false 实现自定义按钮）
-    frame: false,
+    // 参考 Hermes Desktop：隐藏系统标题栏，窗口控制按钮由 OS 原生绘制
+    // Windows：右上角 overlay 按钮（颜色匹配标题栏 abyss-850，高度 32 = h-8）
+    // macOS：左上角交通灯
+    titleBarStyle: isWin || isMac ? 'hidden' : 'default',
+    titleBarOverlay: isWin
+      ? { color: '#0d1219', symbolColor: '#cbd5e1', height: 32 }
+      : false,
     webPreferences: {
       // 安全基线：渲染进程仅通过 HTTP/WS 与后端交互，不暴露任何 Node 能力
       contextIsolation: true,
@@ -195,18 +205,6 @@ function createWindow() {
       sandbox: false, // preload 需要 require('electron')，sandbox 模式下不可用
       preload: path.join(__dirname, 'preload.cjs'),
     },
-  });
-
-  // IPC handlers for window controls
-  const { ipcMain } = require('electron');
-  ipcMain.on('window:minimize', () => {
-    mainWindow?.minimize();
-  });
-  ipcMain.on('window:close', () => {
-    mainWindow?.close();
-  });
-  ipcMain.handle('window:get-platform', () => {
-    return process.platform;
   });
 
   // 加载策略：开发模式走 Vite dev server，生产模式由 FastAPI 托管 desktop/dist
@@ -231,7 +229,12 @@ function createWindow() {
     mainWindow = null;
   });
 
-  mainWindow.loadURL(target);
+  // 启动时清理 HTTP 缓存：避免 Chromium 启发式缓存导致 dist 更新后仍加载过期前端
+  mainWindow.webContents.session
+    .clearCache()
+    .finally(() => {
+      mainWindow?.loadURL(target);
+    });
 }
 
 // ---------------- 生命周期 ----------------

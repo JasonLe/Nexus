@@ -5,16 +5,10 @@
  * 通过 contextBridge 暴露有限的 API，避免直接暴露 Node.js 能力。
  */
 
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge } = require('electron');
 
-// 暴露平台信息和窗口控制 API
+// 窗口控制按钮由 OS 原生绘制（titleBarStyle: 'hidden' + titleBarOverlay），
+// 此处仅暴露平台信息供渲染进程做平台相关的布局避让（如 macOS 交通灯在左侧）
 contextBridge.exposeInMainWorld('electronAPI', {
   platform: process.platform,
-
-  // 窗口控制
-  windowMinimize: () => ipcRenderer.send('window:minimize'),
-  windowClose: () => ipcRenderer.send('window:close'),
-
-  // 获取平台信息（异步）
-  getPlatform: () => ipcRenderer.invoke('window:get-platform'),
 });

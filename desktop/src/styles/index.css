@@ -187,6 +187,15 @@ body {
 }
 
 /* ---------- 通用小元素 ---------- */
+
+/* ---------- 窗口标题栏拖拽区域 ---------- */
+.app-drag {
+  -webkit-app-region: drag;
+}
+.app-no-drag {
+  -webkit-app-region: no-drag;
+}
+
 .panel {
   @apply rounded-xl border border-abyss-600/60 bg-abyss-850/80 backdrop-blur-sm;
 }
