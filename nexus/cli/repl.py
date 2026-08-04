@@ -158,7 +158,7 @@ class Repl:
         输入 / 后 Tab 即可补全所有内置命令名。
         """
         return WordCompleter([
-            "/clear", "/save", "/tools", "/quit", "/help", "/exit",
+            "/clear", "/save", "/tools", "/mcp", "/quit", "/help", "/exit",
         ])
 
     # ------------------------------------------------------------------
@@ -180,6 +180,8 @@ class Repl:
         """
         self._running = True
         self.display.show_welcome()
+        # CLI 启动即加载配置的 MCP server（安装失败不阻断 REPL）
+        await self._install_mcp()
 
         while self._running:
             try:
@@ -217,6 +219,24 @@ class Repl:
 
         # 退出：保存会话 + 显示统计
         self._handle_exit()
+
+    # ------------------------------------------------------------------
+    # MCP 启动安装
+    # ------------------------------------------------------------------
+
+    async def _install_mcp(self) -> None:
+        """启动时按配置安装 MCP 插件（连接 MCP server 并注册远端工具）。
+
+        CLI 启动即加载配置的 mcp_servers；无启用项时 ``install_mcp``
+        为 no-op（返回 None），安装异常仅记 warning —— MCP 失败
+        不影响 REPL 正常启动。
+        """
+        try:
+            from nexus.core.factory import install_mcp
+
+            await install_mcp(self.agent, self.config)
+        except Exception as exc:
+            logger.warning("MCP 插件安装失败（REPL 启动）: %s", exc)
 
     # ------------------------------------------------------------------
     # 会话恢复
@@ -508,6 +528,7 @@ class Repl:
         /clear  - 清空对话上下文（重新创建 Agent，保留配置和工具）
         /save   - 手动保存当前会话
         /tools  - 列出当前已注册的工具
+        /mcp    - 管理 MCP server（list/tools/add/remove/enable/disable/reconnect）
         /quit   - 退出 REPL
         /exit   - 退出 REPL（同 /quit）
         /help   - 显示帮助
@@ -543,6 +564,14 @@ class Repl:
             # 根据配置文件重新注册工具
             register_tools(new_agent, self.config)
             self.agent = new_agent
+            # 重新接入 MCP 工具：register_tools 只注册内置工具，
+            # 不重装 MCPPlugin 会丢失全部 mcp__ 前缀工具
+            if self.config.mcp_servers:
+                from nexus.core.factory import install_mcp
+                try:
+                    await install_mcp(new_agent, self.config)
+                except Exception as exc:
+                    logger.warning("MCP 重装失败（/clear）: %s", exc)
             self._conversation_history.clear()
             self.display.show_info("上下文已清空，工具已重新注册")
             logger.info("Agent recreated for /clear command")
@@ -570,6 +599,10 @@ class Repl:
             # 列出已注册的工具（Rich Table 渲染）
             self.display.render_tools_table(list(self.agent.tool_registry))
 
+        elif command == "/mcp":
+            # MCP server 管理（list/tools/add/remove/enable/disable/reconnect）
+            await self._handle_mcp_command(parts[1] if len(parts) > 1 else "")
+
         elif command == "/help":
             # 显示帮助信息（Rich Panel 渲染）
             self.display.render_help_panel()
@@ -578,6 +611,232 @@ class Repl:
             self.display.render_warning(
                 f"未知命令: {command}，输入 /help 查看帮助"
             )
+
+    # ------------------------------------------------------------------
+    # /mcp 命令族
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mcp_usage() -> str:
+        """返回 /mcp 命令族的用法说明文本。"""
+        return (
+            "用法:\n"
+            "  /mcp [list]                         列出所有 MCP server\n"
+            "  /mcp tools <名称>                   列出该 server 的远端工具\n"
+            "  /mcp add <名称> <命令> [参数...]    添加 stdio server\n"
+            "  /mcp add <名称> --url <url>         添加 http server\n"
+            "  /mcp remove <名称>                  移除 server（断开并注销工具）\n"
+            "  /mcp enable <名称>                  启用 server（重连并注册工具）\n"
+            "  /mcp disable <名称>                 禁用 server（断开并注销工具）\n"
+            "  /mcp reconnect <名称>               重连 server 并刷新工具"
+        )
+
+    def _get_mcp_plugin(self) -> Any | None:
+        """从当前 Agent 的插件注册中心获取 MCPPlugin，未安装返回 None。"""
+        return self.agent.plugin_registry.get("mcp")
+
+    async def _reload_or_install_mcp(self) -> None:
+        """按当前配置热生效 MCP：已安装插件则全量 reload，否则安装插件。
+
+        用于 add / enable / disable 后的配置热更新。无启用的 server 时
+        ``install_mcp`` 为 no-op（返回 None），行为与之前一致。
+        """
+        plugin = self._get_mcp_plugin()
+        if plugin is not None:
+            await plugin.reload(self.config.mcp_servers)
+        else:
+            from nexus.core.factory import install_mcp
+            await install_mcp(self.agent, self.config)
+
+    def _save_config_quietly(self) -> None:
+        """持久化当前配置到用户级 ~/.nexus/nexus.yaml，失败仅提示不阻断。"""
+        from nexus.cli.config import save_config
+
+        try:
+            save_config(self.config)
+        except Exception as exc:
+            self.display.render_warning(f"配置保存失败: {exc}")
+            logger.warning("Failed to save config after /mcp change", exc_info=True)
+
+    def _mcp_status_list(self) -> list[dict[str, Any]]:
+        """汇总 MCP server 状态：manager 运行时状态 + 配置中未接管的条目。
+
+        manager 未安装（如启动时无启用 server）时，配置中的 server 以
+        disabled/disconnected 形态补入列表，保证 ``/mcp list`` 始终
+        反映配置文件的真实内容。
+        """
+        plugin = self._get_mcp_plugin()
+        status_list: list[dict[str, Any]] = (
+            plugin.manager.get_status() if plugin is not None else []
+        )
+        known = {s["name"] for s in status_list}
+        for name, cfg in self.config.mcp_servers.items():
+            if name in known:
+                continue
+            status_list.append({
+                "name": name,
+                "transport": cfg.transport,
+                "enabled": cfg.enabled,
+                "status": "disabled" if not cfg.enabled else "disconnected",
+                "error": None,
+                "tool_count": 0,
+                "tools": [],
+            })
+        return status_list
+
+    async def _handle_mcp_command(self, args: str) -> None:
+        """处理 /mcp 子命令（MCP server 的查看与热管理）。
+
+        热生效路径：
+        - add / enable / disable：修改 ``config.mcp_servers`` 并
+          ``save_config`` 持久化后，经 ``_reload_or_install_mcp`` 全量
+          重载（插件不存在时走 ``factory.install_mcp`` 首次安装）；
+        - remove：``manager.remove(name, registry)`` 断开并注销工具后
+          从配置移除并持久化；
+        - reconnect：``manager.reconnect(name, registry)`` 单点重连刷新工具。
+
+        Parameters
+        ----------
+        args : str
+            /mcp 之后的参数串（可能为空，等价于 ``list``）。
+        """
+        from nexus.cli.config import MCPServerConfig
+
+        tokens = args.split()
+        sub = tokens[0].lower() if tokens else "list"
+
+        if sub == "list":
+            self.display.render_mcp_servers(self._mcp_status_list())
+
+        elif sub == "tools":
+            if len(tokens) != 2:
+                self.display.show_info(self._mcp_usage())
+                return
+            name = tokens[1]
+            status = next(
+                (s for s in self._mcp_status_list() if s["name"] == name), None,
+            )
+            if status is None:
+                self.display.render_warning(f"未找到 MCP server: {name}")
+                return
+            self.display.render_mcp_tools(name, status.get("tools", []))
+
+        elif sub == "add":
+            if len(tokens) < 3:
+                self.display.show_info(self._mcp_usage())
+                return
+            name = tokens[1]
+            if name in self.config.mcp_servers:
+                self.display.render_warning(f"MCP server 已存在: {name}")
+                return
+            if tokens[2] == "--url":
+                # http 模式：/mcp add <名称> --url <url>
+                if len(tokens) != 4:
+                    self.display.show_info(self._mcp_usage())
+                    return
+                cfg = MCPServerConfig(url=tokens[3])
+            else:
+                # stdio 模式：/mcp add <名称> <命令> [参数...]
+                cfg = MCPServerConfig(command=tokens[2], args=tokens[3:])
+            self.config.mcp_servers[name] = cfg
+            self._save_config_quietly()
+            self.display.show_info(f"正在连接 MCP server '{name}'...")
+            await self._reload_or_install_mcp()
+            status = next(
+                (s for s in self._mcp_status_list() if s["name"] == name), None,
+            )
+            if status and status["status"] == "connected":
+                self.display.show_info(
+                    f"已添加 MCP server '{name}'，注册 {status['tool_count']} 个工具"
+                )
+            elif status and status["status"] == "error":
+                self.display.render_warning(
+                    f"MCP server '{name}' 已保存但连接失败: {status['error']}"
+                )
+            else:
+                self.display.show_info(f"已添加 MCP server '{name}'")
+            logger.info("MCP server added via /mcp add", extra={"name": name})
+
+        elif sub == "remove":
+            if len(tokens) != 2:
+                self.display.show_info(self._mcp_usage())
+                return
+            name = tokens[1]
+            if name not in self.config.mcp_servers:
+                self.display.render_warning(f"未找到 MCP server: {name}")
+                return
+            plugin = self._get_mcp_plugin()
+            if plugin is not None:
+                await plugin.manager.remove(name, self.agent.tool_registry)
+            del self.config.mcp_servers[name]
+            self._save_config_quietly()
+            self.display.show_info(f"已移除 MCP server '{name}'")
+            logger.info("MCP server removed via /mcp remove", extra={"name": name})
+
+        elif sub in ("enable", "disable"):
+            if len(tokens) != 2:
+                self.display.show_info(self._mcp_usage())
+                return
+            name = tokens[1]
+            cfg = self.config.mcp_servers.get(name)
+            if cfg is None:
+                self.display.render_warning(f"未找到 MCP server: {name}")
+                return
+            cfg.enabled = sub == "enable"
+            self._save_config_quietly()
+            await self._reload_or_install_mcp()
+            if cfg.enabled:
+                status = next(
+                    (s for s in self._mcp_status_list() if s["name"] == name), None,
+                )
+                if status and status["status"] == "connected":
+                    self.display.show_info(
+                        f"已启用 MCP server '{name}'，注册 {status['tool_count']} 个工具"
+                    )
+                elif status and status["status"] == "error":
+                    self.display.render_warning(
+                        f"MCP server '{name}' 已启用但连接失败: {status['error']}"
+                    )
+                else:
+                    self.display.show_info(f"已启用 MCP server '{name}'")
+            else:
+                self.display.show_info(f"已禁用 MCP server '{name}'，工具已注销")
+            logger.info(
+                "MCP server toggled via /mcp",
+                extra={"name": name, "enabled": cfg.enabled},
+            )
+
+        elif sub == "reconnect":
+            if len(tokens) != 2:
+                self.display.show_info(self._mcp_usage())
+                return
+            name = tokens[1]
+            plugin = self._get_mcp_plugin()
+            if plugin is None:
+                self.display.render_warning(
+                    "MCP 插件未安装（当前无启用的 server），无法重连"
+                )
+                return
+            ok = await plugin.manager.reconnect(name, self.agent.tool_registry)
+            if ok:
+                status = next(
+                    (s for s in plugin.manager.get_status() if s["name"] == name),
+                    None,
+                )
+                count = status["tool_count"] if status else 0
+                self.display.show_info(
+                    f"已重连 MCP server '{name}'，注册 {count} 个工具"
+                )
+            else:
+                self.display.render_warning(f"重连失败: {name}")
+            logger.info(
+                "MCP server reconnected via /mcp reconnect",
+                extra={"name": name, "ok": ok},
+            )
+
+        else:
+            self.display.render_warning(f"未知 /mcp 子命令: {sub}")
+            self.display.show_info(self._mcp_usage())
 
     # ------------------------------------------------------------------
     # 退出处理

@@ -31,6 +31,9 @@ cli = [
     "rich>=13.0.0",
     "prompt-toolkit>=3.0.0",
 ]
+mcp = [
+    "mcp>=1.10.0",
+]
 server = [
     "fastapi>=0.110",
     "uvicorn>=0.29",

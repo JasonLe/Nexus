@@ -122,6 +122,10 @@ def _run_single(agent: Agent, config: NexusConfig, prompt: str) -> None:
     """直接执行模式：运行一次任务后退出。"""
 
     async def _run() -> None:
+        # 在事件循环内安装 MCP 插件（无启用 server 时为 no-op）
+        from nexus.core.factory import install_mcp
+        await install_mcp(agent, config)
+
         try:
             from nexus.cli.display import DisplayManager
         except ImportError:

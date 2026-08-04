@@ -8,6 +8,7 @@ import { Toasts } from './components/Toasts'
 import { ChatView } from './views/ChatView'
 import { ConfigView } from './views/ConfigView'
 import { ToolsView } from './views/ToolsView'
+import { McpView } from './views/McpView'
 
 export default function App() {
   const view = useAppStore((s) => s.view)
@@ -40,6 +41,7 @@ export default function App() {
               {view === 'chat' && <ChatView />}
               {view === 'config' && <ConfigView />}
               {view === 'tools' && <ToolsView />}
+              {view === 'mcp' && <McpView />}
             </motion.div>
           </AnimatePresence>
         </main>

@@ -19,8 +19,13 @@ REST（前缀 /api）：
 - GET    /api/sessions         会话列表
 - GET    /api/sessions/{id}    会话详情（元信息 + messages）
 - DELETE /api/sessions/{id}    删除会话（同步删日志）
-- GET    /api/tools            已注册工具列表
+- GET    /api/tools            已注册工具列表（内置 origin=builtin + MCP origin=mcp）
 - GET    /api/health           健康检查
+- GET    /api/mcp              MCP server 列表（配置 + 运行时状态合并）
+- POST   /api/mcp              新增 MCP server（校验 + 持久化 + 热连接）
+- PUT    /api/mcp/{name}       更新 MCP server（enabled/command/args/env/url 子集）
+- DELETE /api/mcp/{name}       移除 MCP server（断开 + 注销工具 + 删配置）
+- POST   /api/mcp/{name}/reconnect  重连刷新工具列表
 
 WebSocket /ws/chat：
 - 客户端 → 服务端：{"type": "message"|"reset"|"restore", ...}
@@ -36,6 +41,7 @@ import asyncio
 import json
 import os
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +85,20 @@ def _mask_api_key(api_key: str | None) -> tuple[bool, str | None]:
     return True, f"{api_key[:3]}****{api_key[-_API_KEY_MASK_TAIL:]}"
 
 
+def _mask_env_value(value: str | None) -> str:
+    """对 MCP env 值应用与 api_key 一致的前3后4掩码，避免 token 类 env 泄露。
+
+    空值返回空字符串；短值返回 ``****``（与 ``_mask_api_key`` 规则一致）。
+    """
+    _, masked = _mask_api_key(value)
+    return masked or ""
+
+
+def _mask_env(env: dict[str, str]) -> dict[str, str]:
+    """对 MCP env 字典的每个值应用掩码。"""
+    return {k: _mask_env_value(v) for k, v in env.items()}
+
+
 def _config_to_json(config: NexusConfig) -> dict[str, Any]:
     """将 NexusConfig 序列化为 API 契约 JSON（api_key 脱敏）。"""
     providers: dict[str, Any] = {}
@@ -92,6 +112,17 @@ def _config_to_json(config: NexusConfig) -> dict[str, Any]:
             "context_window_tokens": pc.context_window_tokens,
             "base_url": pc.base_url,
         }
+    mcp_servers: dict[str, Any] = {}
+    for name, sc in config.mcp_servers.items():
+        mcp_servers[name] = {
+            "command": sc.command,
+            "args": list(sc.args),
+            # env 脱敏：掩码回传可经 _merge_config_json 原样合并而不覆盖明文
+            "env": _mask_env(sc.env),
+            "url": sc.url,
+            "enabled": sc.enabled,
+            "transport": sc.transport,
+        }
     return {
         "providers": providers,
         "default_provider": config.default_provider,
@@ -100,6 +131,7 @@ def _config_to_json(config: NexusConfig) -> dict[str, Any]:
             "max_steps": config.agent.max_steps,
         },
         "tools": {"enabled": list(config.tools.enabled)},
+        "mcp_servers": mcp_servers,
         "stream": config.stream,
     }
 
@@ -158,9 +190,147 @@ def _merge_config_json(config: NexusConfig, data: dict[str, Any]) -> None:
     if isinstance(tools, dict) and isinstance(tools.get("enabled"), list):
         config.tools.enabled = [str(t) for t in tools["enabled"]]
 
+    # mcp_servers —— 逐 server 合并：已存在逐字段更新，不存在新增；非法项跳过
+    mcp_servers = data.get("mcp_servers")
+    if isinstance(mcp_servers, dict):
+        from nexus.cli.config import MCPServerConfig
+
+        for name, srv in mcp_servers.items():
+            if not isinstance(srv, dict):
+                continue
+            name = str(name)
+            existing = config.mcp_servers.get(name)
+            if existing is None:
+                # 新增 server：command / url 至少一个，否则视为非法项跳过
+                command = srv.get("command")
+                url = srv.get("url")
+                if not command and not url:
+                    continue
+                config.mcp_servers[name] = MCPServerConfig(
+                    command=str(command) if command else None,
+                    args=[str(a) for a in (srv.get("args") or [])],
+                    env={str(k): str(v) for k, v in (srv.get("env") or {}).items()},
+                    url=str(url) if url else None,
+                    enabled=bool(srv.get("enabled", True)),
+                )
+            else:
+                # 已存在：逐字段更新（env 掩码回传或空值不修改对应 key）
+                if "command" in srv:
+                    existing.command = str(srv["command"]) if srv["command"] else None
+                if "args" in srv:
+                    existing.args = [str(a) for a in (srv["args"] or [])]
+                if "url" in srv:
+                    existing.url = str(srv["url"]) if srv["url"] else None
+                if "enabled" in srv and srv["enabled"] is not None:
+                    existing.enabled = bool(srv["enabled"])
+                env_updates = srv.get("env")
+                if isinstance(env_updates, dict):
+                    _merge_server_env(existing, env_updates)
+
     # stream
     if data.get("stream") is not None:
         config.stream = bool(data["stream"])
+
+
+# ------------------------------------------------------------------
+# MCP 接线与状态
+# ------------------------------------------------------------------
+
+
+async def _get_mcp_plugin(app: FastAPI) -> "MCPPlugin | None":
+    """获取当前 agent 的 MCP 插件；未安装时按配置安装并返回。
+
+    无 enabled server 时 ``install_mcp`` 返回 None（no-op）；
+    安装失败同样返回 None —— MCP server 多为外部进程/服务，
+    其失败不应阻断 Agent/Server 启动。
+    """
+    plugin = app.state.agent.plugin_registry.get("mcp")
+    if plugin is None:
+        from nexus.core.factory import install_mcp
+
+        plugin = await install_mcp(app.state.agent, app.state.config)
+    return plugin
+
+
+async def _reload_mcp(app: FastAPI) -> None:
+    """按最新 mcp_servers 配置全量热重载 MCP 插件（断开后重连）。"""
+    plugin = await _get_mcp_plugin(app)
+    if plugin is not None:
+        await plugin.reload(app.state.config.mcp_servers)
+
+
+def _merge_server_env(sc: "MCPServerConfig", env_updates: dict[str, Any]) -> None:
+    """合并单个 MCP server 的 env：掩码回传或空值不修改，否则更新对应 key。
+
+    与 providers 的 api_key 掩码规则一致：前端回传的掩码值（与当前掩码
+    相等）表示「不修改」，避免 token 类 env 被误覆盖。
+    """
+    for k, v in env_updates.items():
+        k = str(k)
+        if v is None or v == "":
+            continue
+        current_mask = _mask_env_value(sc.env.get(k))
+        if isinstance(v, str) and v == current_mask:
+            continue
+        sc.env[k] = str(v)
+
+
+async def _mcp_status_items(app: FastAPI) -> list[dict[str, Any]]:
+    """合并 config.mcp_servers（配置字段 + env 掩码）与 manager 运行时状态。
+
+    以配置为骨架逐 server 生成 GET 表示；plugin 存在时用
+    ``manager.get_status()`` 按 name 填充 status/error/tool_count/tools，
+    否则按配置推断：disabled → "disabled"，其余 → "disconnected"。
+    """
+    cfg: NexusConfig = app.state.config
+    runtime: dict[str, dict[str, Any]] = {}
+    plugin = await _get_mcp_plugin(app)
+    if plugin is not None:
+        try:
+            runtime = {s["name"]: s for s in plugin.manager.get_status()}
+        except Exception:
+            logger.warning("读取 MCP 运行状态失败", exc_info=True)
+
+    result: list[dict[str, Any]] = []
+    for name, sc in cfg.mcp_servers.items():
+        item: dict[str, Any] = {
+            "name": name,
+            "command": sc.command,
+            "args": list(sc.args),
+            "env": _mask_env(sc.env),
+            "url": sc.url,
+            "enabled": sc.enabled,
+            "transport": sc.transport,
+        }
+        state = runtime.get(name)
+        if state is not None:
+            item.update(
+                {
+                    "status": state.get("status"),
+                    "error": state.get("error"),
+                    "tool_count": state.get("tool_count", 0),
+                    "tools": list(state.get("tools") or []),
+                }
+            )
+        else:
+            item.update(
+                {
+                    "status": "disabled" if not sc.enabled else "disconnected",
+                    "error": None,
+                    "tool_count": 0,
+                    "tools": [],
+                }
+            )
+        result.append(item)
+    return result
+
+
+async def _mcp_status_item(app: FastAPI, name: str) -> dict[str, Any] | None:
+    """取单个 MCP server 的 GET 表示；未配置返回 None。"""
+    for s in await _mcp_status_items(app):
+        if s["name"] == name:
+            return s
+    return None
 
 
 # ------------------------------------------------------------------
@@ -516,7 +686,18 @@ def create_app(
     if session_manager is None:
         session_manager = SessionManager()
 
-    app = FastAPI(title="Nexus Agent Runtime Server")
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI):
+        # create_app 本身是 sync，MCP 建连需要事件循环，
+        # 因此 MCP 插件安装放到启动钩子内执行（有 enabled server 才安装，
+        # 无则 no-op；失败不阻断服务启动）
+        try:
+            await _get_mcp_plugin(app)
+        except Exception:
+            logger.warning("MCP 初始化失败，跳过 MCP 能力", exc_info=True)
+        yield
+
+    app = FastAPI(title="Nexus Agent Runtime Server", lifespan=_lifespan)
     app.state.config = config
     app.state.agent = agent
     app.state.session_manager = session_manager
@@ -553,10 +734,13 @@ def create_app(
 
         # 重建 Agent，使新配置（provider / model / api_key 等）立即生效
         try:
-            from nexus.core.factory import create_agent
-            new_agent = create_agent(cfg)
+            from nexus.core.factory import create_agent_async
+
+            new_agent = await create_agent_async(cfg)
             request.app.state.config = cfg
             request.app.state.agent = new_agent
+            # startup 钩子只在启动时跑一次，agent 重建后需重新安装 MCP
+            await _get_mcp_plugin(request.app)
             logger.info(
                 "Config saved & agent rebuilt: provider=%s, model=%s",
                 cfg.default_provider,
@@ -593,7 +777,45 @@ def create_app(
 
     @app.get("/api/tools")
     async def list_tools(request: Request) -> list[dict[str, Any]]:
-        """返回所有可用工具（不管是否启用）。"""
+        """返回所有已注册工具：内置工具（origin=builtin）+ MCP 工具（origin=mcp）。
+
+        主路径以 ``agent.tool_registry`` 为准（含 MCP 远端工具与动态注册的
+        工具）；registry 为空时退回内置工具静态构造作为兜底，保证前端
+        仍能拿到内置工具清单。
+        """
+        try:
+            registered = list(request.app.state.agent.tool_registry.list())
+        except Exception:
+            registered = []
+        if registered:
+            result: list[dict[str, Any]] = []
+            for tool in registered:
+                name = tool.name
+                if name.startswith("mcp__"):
+                    # 命名约定 mcp__{server}__{tool}，split 取第 2 段为来源 server
+                    parts = name.split("__")
+                    result.append(
+                        {
+                            "name": name,
+                            "description": tool.description,
+                            "schema": tool.schema,
+                            "origin": "mcp",
+                            "server": parts[1] if len(parts) >= 2 else None,
+                        }
+                    )
+                else:
+                    result.append(
+                        {
+                            "name": name,
+                            "description": tool.description,
+                            "schema": tool.schema,
+                            "origin": "builtin",
+                            "server": None,
+                        }
+                    )
+            return result
+
+        # 兜底：registry 为空时退回内置工具静态构造
         from nexus.tools.file_tools import (
             ReadFileTool,
             WriteFileTool,
@@ -615,9 +837,146 @@ def create_app(
                 "name": name,
                 "description": tool.description,
                 "schema": tool.schema,
+                "origin": "builtin",
+                "server": None,
             }
             for name, tool in all_tools.items()
         ]
+
+    # ---------------- MCP server 管理 ----------------
+
+    def _save_mcp_config(request: Request) -> None:
+        """持久化当前配置（mcp_servers 变更后统一调用）。"""
+        try:
+            save_config(
+                request.app.state.config,
+                path=request.app.state.config_save_path,
+            )
+        except Exception as e:
+            logger.warning("Failed to save config: %s", e)
+            raise HTTPException(status_code=500, detail=f"配置保存失败: {e}")
+
+    @app.get("/api/mcp")
+    async def list_mcp_servers(request: Request) -> list[dict[str, Any]]:
+        """MCP server 列表：配置（env 脱敏）与运行时状态合并。"""
+        return await _mcp_status_items(request.app)
+
+    @app.post("/api/mcp")
+    async def create_mcp_server(request: Request) -> dict[str, Any]:
+        """新增 MCP server：校验 → 写配置 → 持久化 → 热重载。"""
+        from nexus.cli.config import MCPServerConfig
+
+        cfg: NexusConfig = request.app.state.config
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="请求体不是合法 JSON")
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+
+        name = str(data.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="name 不能为空")
+        if name in cfg.mcp_servers:
+            raise HTTPException(status_code=400, detail=f"MCP server '{name}' 已存在")
+
+        command = data.get("command")
+        url = data.get("url")
+        # command 与 url 至少提供一个（stdio / http 两种传输）
+        if not command and not url:
+            raise HTTPException(
+                status_code=400, detail="command 与 url 至少提供一个"
+            )
+
+        cfg.mcp_servers[name] = MCPServerConfig(
+            command=str(command) if command else None,
+            args=[str(a) for a in (data.get("args") or [])],
+            env={str(k): str(v) for k, v in (data.get("env") or {}).items()},
+            url=str(url) if url else None,
+            enabled=bool(data.get("enabled", True)),
+        )
+        _save_mcp_config(request)
+        await _reload_mcp(request.app)
+        return await _mcp_status_item(request.app, name)
+
+    @app.put("/api/mcp/{name}")
+    async def update_mcp_server(request: Request, name: str) -> dict[str, Any]:
+        """更新 MCP server 配置子集并热重载（env 支持掩码回传）。"""
+        cfg: NexusConfig = request.app.state.config
+        sc = cfg.mcp_servers.get(name)
+        if sc is None:
+            raise HTTPException(status_code=404, detail=f"MCP server '{name}' 不存在")
+
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="请求体不是合法 JSON")
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+
+        # 先按子集计算目标值，校验通过后再落配置，避免 400 时残留半更新状态
+        new_enabled = sc.enabled
+        if "enabled" in data and data["enabled"] is not None:
+            new_enabled = bool(data["enabled"])
+        new_command = sc.command
+        if "command" in data:
+            new_command = str(data["command"]) if data["command"] else None
+        new_url = sc.url
+        if "url" in data:
+            new_url = str(data["url"]) if data["url"] else None
+        # command / url 全被清空时配置不可连接，提前拦截
+        if new_enabled and not new_command and not new_url:
+            raise HTTPException(
+                status_code=400, detail="command 与 url 至少保留一个"
+            )
+
+        sc.enabled = new_enabled
+        sc.command = new_command
+        sc.url = new_url
+        if "args" in data:
+            sc.args = [str(a) for a in (data["args"] or [])]
+        env_updates = data.get("env")
+        if isinstance(env_updates, dict):
+            _merge_server_env(sc, env_updates)
+
+        _save_mcp_config(request)
+        await _reload_mcp(request.app)
+        return await _mcp_status_item(request.app, name)
+
+    @app.delete("/api/mcp/{name}")
+    async def delete_mcp_server(request: Request, name: str) -> dict[str, bool]:
+        """移除 MCP server：删配置 → 持久化 → 热重载（断开 + 注销工具）。"""
+        cfg: NexusConfig = request.app.state.config
+        if name not in cfg.mcp_servers:
+            raise HTTPException(status_code=404, detail=f"MCP server '{name}' 不存在")
+        cfg.mcp_servers.pop(name)
+        _save_mcp_config(request)
+        await _reload_mcp(request.app)
+        return {"ok": True}
+
+    @app.post("/api/mcp/{name}/reconnect")
+    async def reconnect_mcp_server(request: Request, name: str) -> JSONResponse:
+        """重连 MCP server 并刷新工具列表。"""
+        cfg: NexusConfig = request.app.state.config
+        if name not in cfg.mcp_servers:
+            raise HTTPException(status_code=404, detail=f"MCP server '{name}' 不存在")
+        plugin = await _get_mcp_plugin(request.app)
+        if plugin is None:
+            raise HTTPException(status_code=400, detail="MCP 未启用")
+        ok = await plugin.manager.reconnect(
+            name, request.app.state.agent.tool_registry
+        )
+        if not ok:
+            state = await _mcp_status_item(request.app, name)
+            error = state.get("error") if state else None
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "ok": False,
+                    "error": error or f"MCP server '{name}' 重连失败",
+                },
+            )
+        return JSONResponse({"ok": True})
 
     # ---------------- WebSocket 聊天 ----------------
 

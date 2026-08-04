@@ -1,5 +1,7 @@
 import type {
   HealthInfo,
+  McpServerDto,
+  McpServerInput,
   NexusConfigDto,
   SessionDetail,
   SessionSummary,
@@ -34,4 +36,18 @@ export const api = {
   deleteSession: (id: string) =>
     request<{ ok: boolean }>(`/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   listTools: () => request<ToolInfo[]>('/tools'),
+  listMcp: () => request<McpServerDto[]>('/mcp'),
+  createMcp: (input: McpServerInput) =>
+    request<McpServerDto>('/mcp', { method: 'POST', body: JSON.stringify(input) }),
+  updateMcp: (name: string, patch: Partial<Omit<McpServerInput, 'name'>>) =>
+    request<McpServerDto>(`/mcp/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      body: JSON.stringify(patch),
+    }),
+  deleteMcp: (name: string) =>
+    request<{ ok: boolean }>(`/mcp/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  reconnectMcp: (name: string) =>
+    request<{ ok: boolean }>(`/mcp/${encodeURIComponent(name)}/reconnect`, {
+      method: 'POST',
+    }),
 }

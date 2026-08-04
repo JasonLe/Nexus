@@ -64,6 +64,45 @@ export interface ToolInfo {
   name: string
   description: string
   schema: ToolSchema
+  /** 来源：内置工具或 MCP 服务器（旧后端可能缺失，按 mcp__ 前缀兜底） */
+  origin?: 'builtin' | 'mcp'
+  /** MCP 工具所属服务器名 */
+  server?: string | null
+}
+
+// ---- MCP 服务器契约 ----
+
+export type McpTransport = 'stdio' | 'http'
+
+export interface McpServerTool {
+  name: string
+  description: string
+}
+
+/** GET /api/mcp 返回项：配置字段（env 为掩码）+ 运行时状态 */
+export interface McpServerDto {
+  name: string
+  command: string | null
+  args: string[]
+  /** env 值已掩码（前3后4），仅用于回显，提交未修改项会被后端跳过 */
+  env: Record<string, string> | null
+  url: string | null
+  enabled: boolean
+  transport: McpTransport
+  status: string
+  error: string | null
+  tool_count: number
+  tools: McpServerTool[]
+}
+
+/** POST /api/mcp 与 PUT /api/mcp/{name} 的请求体 */
+export interface McpServerInput {
+  name: string
+  command?: string | null
+  args?: string[]
+  env?: Record<string, string>
+  url?: string | null
+  enabled?: boolean
 }
 
 // ---- WebSocket 消息契约类型 ----

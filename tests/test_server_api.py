@@ -452,3 +452,119 @@ class TestWsChat:
                 m["content"] for m in state.messages if m["role"] == "user"
             ]
             assert user_msgs == ["第一条", "第二条"]
+
+
+# ---------------------------------------------------------------------------
+# MCP /api/mcp 契约测试
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_mcp_connect(monkeypatch):
+    """拦截 MCP 插件获取/安装路径，避免测试触发真实 MCP 连接（npx 进程等）。
+
+    所有 /api/mcp 热连接路径（_reload_mcp / _mcp_status_items / reconnect）
+    都经 _get_mcp_plugin 获取插件，替换为恒返回 None 即可全部截断。
+    """
+
+    async def _no_plugin(app):
+        return None
+
+    monkeypatch.setattr("nexus.server.app._get_mcp_plugin", _no_plugin)
+
+
+class TestMcpApi:
+    """/api/mcp 五个端点 + GET /api/tools origin/server 字段的契约测试。"""
+
+    def test_get_mcp_empty(self, server_env, no_mcp_connect):
+        """GET /api/mcp：空配置返回空列表。"""
+        client = TestClient(server_env["app"])
+        resp = client.get("/api/mcp")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_post_mcp_validation(self, server_env, no_mcp_connect):
+        """POST /api/mcp：缺 name、缺 command 与 url、非 JSON 均 400。"""
+        client = TestClient(server_env["app"])
+        # 缺 name
+        resp = client.post("/api/mcp", json={"command": "npx"})
+        assert resp.status_code == 400
+        assert "name" in resp.json()["detail"]
+        # command 与 url 都缺
+        resp = client.post("/api/mcp", json={"name": "fs"})
+        assert resp.status_code == 400
+        # 请求体不是合法 JSON
+        resp = client.post(
+            "/api/mcp", content="not-json",
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 400
+
+    def test_post_mcp_stdio(self, server_env, no_mcp_connect):
+        """POST /api/mcp 合法 stdio 配置 → 200，随后 GET 包含该 server。"""
+        client = TestClient(server_env["app"])
+        resp = client.post(
+            "/api/mcp",
+            json={"name": "fs", "command": "npx", "args": ["-y", "pkg"]},
+        )
+        assert resp.status_code == 200
+        item = resp.json()
+        assert item["name"] == "fs"
+        assert item["transport"] == "stdio"
+        # 热连接被拦截、无真实插件时按配置推断为 disconnected
+        assert item["status"] == "disconnected"
+        assert item["tool_count"] == 0
+
+        got = client.get("/api/mcp").json()
+        assert [s["name"] for s in got] == ["fs"]
+        assert got[0]["command"] == "npx"
+
+    def test_put_mcp_update_and_404(self, server_env, no_mcp_connect):
+        """PUT /api/mcp/{name}：enabled=false 反映到 GET；不存在 → 404。"""
+        client = TestClient(server_env["app"])
+        client.post("/api/mcp", json={"name": "fs", "command": "npx"})
+
+        resp = client.put("/api/mcp/fs", json={"enabled": False})
+        assert resp.status_code == 200
+        assert resp.json()["enabled"] is False
+
+        got = client.get("/api/mcp").json()
+        assert got[0]["enabled"] is False
+
+        resp = client.put("/api/mcp/ghost", json={"enabled": False})
+        assert resp.status_code == 404
+
+    def test_delete_mcp(self, server_env, no_mcp_connect):
+        """DELETE /api/mcp/{name}：存在 → ok；不存在 → 404。"""
+        client = TestClient(server_env["app"])
+        client.post("/api/mcp", json={"name": "fs", "command": "npx"})
+
+        resp = client.delete("/api/mcp/fs")
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True}
+        assert client.get("/api/mcp").json() == []
+
+        resp = client.delete("/api/mcp/fs")
+        assert resp.status_code == 404
+
+    def test_reconnect_mcp(self, server_env, no_mcp_connect):
+        """POST /api/mcp/{name}/reconnect：不存在 → 404；存在但无插件 → 400。"""
+        client = TestClient(server_env["app"])
+        resp = client.post("/api/mcp/ghost/reconnect")
+        assert resp.status_code == 404
+
+        client.post("/api/mcp", json={"name": "fs", "command": "npx"})
+        resp = client.post("/api/mcp/fs/reconnect")
+        assert resp.status_code == 400
+        assert "MCP 未启用" in resp.json()["detail"]
+
+    def test_tools_origin_builtin(self, server_env, no_mcp_connect):
+        """GET /api/tools：内置工具 origin=builtin、server=None。"""
+        client = TestClient(server_env["app"])
+        resp = client.get("/api/tools")
+        assert resp.status_code == 200
+        tools = resp.json()
+        assert tools
+        for t in tools:
+            assert t["origin"] == "builtin"
+            assert t["server"] is None

@@ -652,6 +652,10 @@ class DisplayManager:
         在 ``/tools`` 命令中使用，将工具注册表中的工具渲染为三列表格：
         名称（cyan 加粗）/ 描述（截断到 ~50 字符）/ 参数（必填加 ``*``）。
 
+        按工具名前缀 ``mcp__`` 分组：内置工具与 MCP 工具分别渲染为两张表，
+        MCP 工具表额外带「Server」列（从 ``mcp__{server}__{tool}`` 解析）。
+        无 MCP 工具时保持原单表渲染，行为与之前完全一致。
+
         Parameters
         ----------
         tools : list
@@ -663,23 +667,161 @@ class DisplayManager:
             logger.debug("Tools table rendered (empty)")
             return
 
-        table = Table(title="已注册工具", show_lines=False, border_style="cyan")
-        table.add_column("名称", style="bold cyan")
-        table.add_column("描述", overflow="fold")
-        table.add_column("参数", style="dim", overflow="fold")
+        # 按 mcp__ 前缀分组：内置工具 / MCP 工具
+        builtin_tools = [t for t in tools if not str(getattr(t, "name", "")).startswith("mcp__")]
+        mcp_tools = [t for t in tools if str(getattr(t, "name", "")).startswith("mcp__")]
 
-        for tool in tools:
-            desc = str(getattr(tool, "description", "") or "")
-            if len(desc) > 50:
-                desc = desc[:47] + "..."
+        # 存在 MCP 工具时分组渲染，否则保持原单表标题（向后兼容）
+        builtin_title = "内置工具" if mcp_tools else "已注册工具"
+
+        if builtin_tools:
+            table = Table(title=builtin_title, show_lines=False, border_style="cyan")
+            table.add_column("名称", style="bold cyan")
+            table.add_column("描述", overflow="fold")
+            table.add_column("参数", style="dim", overflow="fold")
+
+            for tool in builtin_tools:
+                desc = str(getattr(tool, "description", "") or "")
+                if len(desc) > 50:
+                    desc = desc[:47] + "..."
+                table.add_row(
+                    str(getattr(tool, "name", "unknown")),
+                    desc,
+                    self._format_tool_params(getattr(tool, "schema", None)),
+                )
+
+            self.console.print(table)
+
+        if mcp_tools:
+            mcp_table = Table(title="MCP 工具", show_lines=False, border_style="magenta")
+            mcp_table.add_column("名称", style="bold magenta")
+            mcp_table.add_column("Server", style="cyan")
+            mcp_table.add_column("描述", overflow="fold")
+            mcp_table.add_column("参数", style="dim", overflow="fold")
+
+            for tool in mcp_tools:
+                name = str(getattr(tool, "name", "unknown"))
+                desc = str(getattr(tool, "description", "") or "")
+                if len(desc) > 50:
+                    desc = desc[:47] + "..."
+                mcp_table.add_row(
+                    name,
+                    self._extract_mcp_server(name),
+                    desc,
+                    self._format_tool_params(getattr(tool, "schema", None)),
+                )
+
+            self.console.print(mcp_table)
+
+        logger.info("Tools table rendered", extra={"count": len(tools)})
+
+    @staticmethod
+    def _extract_mcp_server(tool_name: str) -> str:
+        """从 ``mcp__{server}__{tool}`` 形式的工具名解析所属 server 名。"""
+        parts = tool_name.split("__")
+        if len(parts) >= 3:
+            return parts[1]
+        return "-"
+
+    # ------------------------------------------------------------------
+    # MCP server 状态 / 工具列表
+    # ------------------------------------------------------------------
+
+    def render_mcp_servers(self, status_list: list[dict]) -> None:
+        """渲染 MCP server 状态列表为 Rich Table。
+
+        在 ``/mcp`` / ``/mcp list`` 命令中使用，列为：
+        名称 / 类型（stdio|http）/ 启用 / 状态（配颜色）/ 工具数。
+        状态配色：connected 绿、error 红、disabled 灰、其余黄色。
+        空列表时打印 dim 提示并引导 ``/mcp add``。
+
+        Parameters
+        ----------
+        status_list : list[dict]
+            ``MCPManager.get_status()`` 的返回项，每项含
+            ``name`` / ``transport`` / ``enabled`` / ``status`` /
+            ``error`` / ``tool_count``。
+        """
+        if not status_list:
+            self.console.print(Text(
+                "（暂无 MCP server，使用 /mcp add <名称> <命令> [参数...] "
+                "或 /mcp add <名称> --url <url> 添加）",
+                style="dim",
+            ))
+            logger.debug("MCP servers table rendered (empty)")
+            return
+
+        status_styles = {
+            "connected": "green",
+            "error": "red",
+            "disabled": "dim",
+        }
+
+        table = Table(title="MCP Servers", show_lines=False, border_style="cyan")
+        table.add_column("名称", style="bold cyan")
+        table.add_column("类型", style="dim")
+        table.add_column("启用", justify="center")
+        table.add_column("状态")
+        table.add_column("工具数", justify="right")
+
+        for item in status_list:
+            status = str(item.get("status", "unknown"))
+            style = status_styles.get(status, "yellow")
+            status_text = Text(status, style=style)
+            error = item.get("error")
+            if status == "error" and error:
+                error_str = str(error)
+                if len(error_str) > 40:
+                    error_str = error_str[:37] + "..."
+                status_text.append(f" ({error_str})", style="red")
             table.add_row(
-                str(getattr(tool, "name", "unknown")),
-                desc,
-                self._format_tool_params(getattr(tool, "schema", None)),
+                str(item.get("name", "unknown")),
+                str(item.get("transport", "stdio")),
+                "✓" if item.get("enabled") else "✗",
+                status_text,
+                str(item.get("tool_count", 0)),
             )
 
         self.console.print(table)
-        logger.info("Tools table rendered", extra={"count": len(tools)})
+        logger.info("MCP servers table rendered", extra={"count": len(status_list)})
+
+    def render_mcp_tools(self, server_name: str, tools: list[dict]) -> None:
+        """渲染指定 MCP server 的远端工具列表为 Rich Table。
+
+        在 ``/mcp tools <name>`` 命令中使用，列为：注册名（cyan 加粗）/ 描述。
+        空列表时打印 dim 提示。
+
+        Parameters
+        ----------
+        server_name : str
+            MCP server 名称，用于表格标题。
+        tools : list[dict]
+            工具信息列表，每项含 ``name`` / ``description``。
+        """
+        if not tools:
+            self.console.print(Text(
+                f"（server '{server_name}' 暂无已注册的工具）", style="dim",
+            ))
+            logger.debug("MCP tools table rendered (empty)", extra={"server": server_name})
+            return
+
+        table = Table(
+            title=f"MCP 工具 · {server_name}", show_lines=False, border_style="magenta",
+        )
+        table.add_column("名称", style="bold magenta")
+        table.add_column("描述", overflow="fold")
+
+        for tool in tools:
+            desc = str(tool.get("description", "") or "")
+            if len(desc) > 60:
+                desc = desc[:57] + "..."
+            table.add_row(str(tool.get("name", "unknown")), desc)
+
+        self.console.print(table)
+        logger.info(
+            "MCP tools table rendered",
+            extra={"server": server_name, "count": len(tools)},
+        )
 
     @staticmethod
     def _format_tool_params(schema: dict | None) -> str:
@@ -716,6 +858,7 @@ class DisplayManager:
         cmd_table.add_row("/clear", "清空对话上下文")
         cmd_table.add_row("/save", "保存当前会话")
         cmd_table.add_row("/tools", "列出已注册工具")
+        cmd_table.add_row("/mcp", "管理 MCP server（list/tools/add/remove/enable/disable/reconnect）")
         cmd_table.add_row("/quit, /exit", "退出 REPL")
         cmd_table.add_row("/help", "显示此帮助")
 

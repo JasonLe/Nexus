@@ -93,6 +93,28 @@ class ToolsConfig:
 
 
 @dataclass
+class MCPServerConfig:
+    """单个 MCP（Model Context Protocol）server 的配置。
+
+    支持两种传输模式：
+    - stdio：配置 command（及可选 args/env），由本地子进程启动；
+    - http：配置 url，连接远程 MCP 服务。
+
+    env 中的字符串值支持 ${VAR} / ${VAR:-default} 环境变量引用。
+    """
+    command: str | None = None
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    url: str | None = None
+    enabled: bool = True
+
+    @property
+    def transport(self) -> str:
+        """传输模式：配置了 url 时为 "http"，否则为 "stdio"。"""
+        return "http" if self.url else "stdio"
+
+
+@dataclass
 class NexusConfig:
     """Nexus 聚合配置 —— 完整配置文件的内存表示。
 
@@ -104,6 +126,7 @@ class NexusConfig:
     default_provider: str = "openai"
     agent: AgentConfig = field(default_factory=AgentConfig)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
+    mcp_servers: dict[str, MCPServerConfig] = field(default_factory=dict)
     stream: bool = True  # 流式输出开关，默认开启
 
     # 运行时字段（不从配置文件直接写入，由 CLI 或 load_config 动态设置）
@@ -403,6 +426,54 @@ def _apply_file_config(config: NexusConfig, path: Path) -> None:
         if "enabled" in raw["tools"] and isinstance(raw["tools"]["enabled"], list):
             config.tools.enabled = [str(t) for t in raw["tools"]["enabled"]]
 
+    # mcp_servers —— 同名条目整项覆盖（浅覆盖，与现有覆盖语义一致）
+    if "mcp_servers" in raw and isinstance(raw["mcp_servers"], dict):
+        for name, srv_raw in raw["mcp_servers"].items():
+            if not isinstance(srv_raw, dict):
+                continue
+
+            command = srv_raw.get("command")
+            url = srv_raw.get("url")
+            if command is not None and not isinstance(command, str):
+                logger.warning("MCP server %r skipped: command must be a string", name)
+                continue
+            if url is not None and not isinstance(url, str):
+                logger.warning("MCP server %r skipped: url must be a string", name)
+                continue
+            if command is None and url is None:
+                logger.warning(
+                    "MCP server %r skipped: either command or url is required", name
+                )
+                continue
+
+            args_raw = srv_raw.get("args", [])
+            if args_raw is None:
+                args_raw = []
+            if not isinstance(args_raw, list):
+                logger.warning("MCP server %r skipped: args must be a list", name)
+                continue
+
+            env: dict[str, str] = {}
+            env_raw = srv_raw.get("env", {})
+            if env_raw is None:
+                env_raw = {}
+            if not isinstance(env_raw, dict):
+                logger.warning("MCP server %r skipped: env must be a mapping", name)
+                continue
+            for env_key, env_val in env_raw.items():
+                if isinstance(env_val, str):
+                    env[str(env_key)] = _resolve_env_refs(env_val)
+                else:
+                    env[str(env_key)] = str(env_val)
+
+            config.mcp_servers[str(name)] = MCPServerConfig(
+                command=command,
+                args=[str(a) for a in args_raw],
+                env=env,
+                url=url,
+                enabled=bool(srv_raw.get("enabled", True)),
+            )
+
     logger.debug("Loaded config from %s", path)
 
 
@@ -561,6 +632,24 @@ def save_config(config: NexusConfig, path: str | None = None) -> str:
     # tools — 始终保存（包括 enabled=[] 表示全部启用、['__none__'] 表示全部禁用）
     data["tools"] = {"enabled": list(config.tools.enabled)}
 
+    # mcp_servers — 空 dict 时不写该节；每个条目只写非默认字段
+    if config.mcp_servers:
+        mcp_data: dict[str, Any] = {}
+        for name, srv in config.mcp_servers.items():
+            sd: dict[str, Any] = {}
+            if srv.command:
+                sd["command"] = srv.command
+            if srv.args:
+                sd["args"] = list(srv.args)
+            if srv.env:
+                sd["env"] = dict(srv.env)
+            if srv.url:
+                sd["url"] = srv.url
+            if not srv.enabled:
+                sd["enabled"] = False
+            mcp_data[name] = sd
+        data["mcp_servers"] = mcp_data
+
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(
             data, f,
@@ -630,4 +719,21 @@ tools:
     - write_file
     - list_dir
     - search_content
+
+# MCP（Model Context Protocol）server 配置
+# 支持两种模式：
+#   - stdio 模式：配置 command（及可选 args、env），由本地子进程启动；
+#     env 值支持 ${VAR} / ${VAR:-default} 环境变量引用。
+#   - http 模式：配置 url，连接远程 MCP 服务。
+# 以下示例默认 enabled: false，请按需开启，避免误连。
+# mcp_servers:
+#   filesystem:                          # stdio 模式示例
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+#     env:
+#       API_KEY: ${MY_API_KEY}
+#     enabled: false
+#   remote:                              # http 模式示例
+#     url: http://localhost:3000/mcp
+#     enabled: false
 """

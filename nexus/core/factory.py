@@ -13,16 +13,25 @@ CLI / Server / REPL 三个调用方都只调这一个入口函数，实现"加�
 - ``create_llm(config)`` —— 根据 config.default_provider 创建对应 LLM 实例
 - ``register_tools(agent, config)`` —— 根据 config.tools.enabled 注册内置工具
 - ``create_agent(config)`` —— 组合上述两步 + Agent 构造，返回就绪的 Agent
+  （同步入口，不接 MCP；server create_app 等事件循环外的调用方使用）
+- ``install_mcp(agent, config)`` —— 按 config.mcp_servers 安装 MCPPlugin，
+  无启用项或失败时返回 None（MCP 失败不阻断 Agent 启动）
+- ``create_agent_async(config)`` —— ``create_agent(config)`` + ``install_mcp``，
+  CLI / Server 等 async 上下文中应优先使用此入口
 """
 
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 from nexus.core.agent.agent import Agent
 from nexus.llm.base import BaseLLM
 from nexus.cli.config import NexusConfig
 from nexus.logging import get_logger
+
+if TYPE_CHECKING:
+    from nexus.tools.mcp.plugin import MCPPlugin
 
 logger = get_logger(__name__)
 
@@ -151,4 +160,67 @@ def create_agent(config: NexusConfig) -> Agent:
         stream=config.stream,
     )
     register_tools(agent, config)
+    return agent
+
+
+async def install_mcp(agent: Agent, config: NexusConfig) -> "MCPPlugin | None":
+    """按 config.mcp_servers 为 Agent 安装 MCP 插件。
+
+    仅在存在至少一个 enabled 的 MCP server 时安装；安装过程（含建连）
+    的任何异常都只记 warning 并返回 None —— MCP server 多为外部
+    进程/服务，其失败不应阻断 Agent 启动。
+
+    Parameters
+    ----------
+    agent : Agent
+        目标 Agent 实例。
+    config : NexusConfig
+        聚合配置实例，读取其 ``mcp_servers`` 字段。
+
+    Returns
+    -------
+    MCPPlugin | None
+        安装成功返回插件实例（可通过 ``agent.plugin_registry.get("mcp")``
+        再次获取）；无启用项或安装失败返回 None。
+    """
+    from nexus.tools.mcp.plugin import MCPPlugin
+
+    enabled = {
+        name: cfg for name, cfg in config.mcp_servers.items() if cfg.enabled
+    }
+    if not enabled:
+        return None
+
+    try:
+        plugin = MCPPlugin(config.mcp_servers)
+        await agent.install(plugin)
+        return plugin
+    except Exception as exc:
+        logger.warning("MCP 插件安装失败，跳过 MCP 能力: %s", exc)
+        return None
+
+
+async def create_agent_async(config: NexusConfig) -> Agent:
+    """异步版 Agent 组装入口：``create_agent(config)`` + MCP 插件接入。
+
+    与同步入口 ``create_agent()`` 的区别仅在于额外执行
+    ``install_mcp(agent, config)`` —— 后者是 async 的（MCP 建连需要
+    事件循环），无法放进同步入口。
+
+    CLI / Server 在 async 上下文中应优先使用本入口；
+    事件循环外的同步调用方（如 server create_app 的同步组装路径）
+    继续使用 ``create_agent()``，MCP 接线由调用方自行处理。
+
+    Parameters
+    ----------
+    config : NexusConfig
+        聚合配置实例。
+
+    Returns
+    -------
+    Agent
+        完成 LLM 配置、工具注册与 MCP 插件安装的 Agent 实例。
+    """
+    agent = create_agent(config)
+    await install_mcp(agent, config)
     return agent
