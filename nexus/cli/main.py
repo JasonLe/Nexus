@@ -452,7 +452,17 @@ def _run_server_command(command: str, argv: list[str]) -> None:
     )
     parser.add_argument("--port", type=int, default=8321, help="监听端口（默认 8321）")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
+    parser.add_argument("--verbose", "-v", action="store_true", help="终端显示 INFO 级别日志")
+    parser.add_argument("--debug", action="store_true", help="终端显示 DEBUG 级别日志")
     args = parser.parse_args(argv)
+
+    # 配置日志：终端级别由 --verbose/--debug 控制，文件始终 DEBUG 持久化
+    # 与 CLI 模式一致，文件写入 ~/.nexus/logs/<session_id>.log
+    run_id = str(uuid.uuid4())[:8]
+    log_file = setup_logging(
+        verbose=args.verbose, debug=args.debug, session_id=run_id,
+    )
+    logger.info("Server 日志文件: %s", log_file)
 
     # 依赖检查：fastapi/uvicorn 为可选依赖（pip install -e ".[server]"）
     try:
@@ -475,6 +485,7 @@ def _run_server_command(command: str, argv: list[str]) -> None:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
 
     print(f"Nexus Server 启动中: http://{args.host}:{args.port}/")
+    print(f"日志文件: {log_file}")
     uvicorn.run(app, host=args.host, port=args.port)
 
 
