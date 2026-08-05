@@ -33,3 +33,10 @@ htmlcov/
 # Project specific
 uv.lock
 nexus.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Agent specs (local artifacts)
+.trae/
