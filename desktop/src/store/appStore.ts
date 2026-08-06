@@ -1,6 +1,12 @@
 import { create } from 'zustand'
 import { api } from '../api/client'
-import type { HealthInfo, McpServerDto, McpServerInput, ToolInfo } from '../api/types'
+import type {
+  HealthInfo,
+  McpServerDto,
+  McpServerInput,
+  McpTestResult,
+  ToolInfo,
+} from '../api/types'
 
 export type ViewKey = 'chat' | 'config' | 'tools' | 'mcp'
 
@@ -18,11 +24,12 @@ interface AppState {
   refreshHealth: () => Promise<void>
   refreshTools: () => Promise<void>
   refreshMcp: () => Promise<void>
-  createMcp: (input: McpServerInput) => Promise<void>
-  updateMcp: (name: string, patch: McpPatch) => Promise<void>
+  createMcp: (input: McpServerInput) => Promise<McpServerDto>
+  updateMcp: (name: string, patch: McpPatch) => Promise<McpServerDto>
   toggleMcp: (name: string, enabled: boolean) => Promise<void>
   removeMcp: (name: string) => Promise<void>
   reconnectMcp: (name: string) => Promise<void>
+  testMcp: (input: McpServerInput) => Promise<McpTestResult>
 }
 
 function errorMessage(e: unknown): string {
@@ -67,8 +74,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   createMcp: async (input) => {
     try {
-      await api.createMcp(input)
+      const dto = await api.createMcp(input)
       await get().refreshMcp()
+      return dto
     } catch (e) {
       set({ mcpError: errorMessage(e) })
       throw e
@@ -76,8 +84,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   updateMcp: async (name, patch) => {
     try {
-      await api.updateMcp(name, patch)
+      const dto = await api.updateMcp(name, patch)
       await get().refreshMcp()
+      return dto
     } catch (e) {
       set({ mcpError: errorMessage(e) })
       throw e
@@ -103,5 +112,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ mcpError: errorMessage(e) })
       throw e
     }
+  },
+  testMcp: async (input) => {
+    return api.testMcp(input)
   },
 }))

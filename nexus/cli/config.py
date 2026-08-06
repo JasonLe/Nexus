@@ -727,11 +727,22 @@ tools:
 #   - http 模式：配置 url，连接远程 MCP 服务。
 # 以下示例默认 enabled: false，请按需开启，避免误连。
 # mcp_servers:
-#   filesystem:                          # stdio 模式示例
+#   filesystem:                          # stdio 模式示例（npx）
 #     command: npx
 #     args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
 #     env:
 #       API_KEY: ${MY_API_KEY}
+#     enabled: false
+#   minimax:                             # stdio 模式示例（uvx + 锁定 mcp 1.x）
+#     command: uvx
+#     args:
+#       - --from
+#       - minimax-coding-plan-mcp
+#       - --with
+#       - mcp<2                          # 依赖 mcp.server.fastmcp（1.x API）时需锁定
+#       - minimax-coding-plan-mcp
+#     env:
+#       MINIMAX_API_KEY: ${MINIMAX_API_KEY}
 #     enabled: false
 #   remote:                              # http 模式示例
 #     url: http://localhost:3000/mcp

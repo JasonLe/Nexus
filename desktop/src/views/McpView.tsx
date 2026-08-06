@@ -3,7 +3,12 @@ import { AnimatePresence, motion } from 'framer-motion'
 import { useAppStore } from '../store/appStore'
 import { toast } from '../store/toastStore'
 import { Toggle } from '../components/Toggle'
-import type { McpServerDto, McpServerInput, McpTransport } from '../api/types'
+import type {
+  McpServerDto,
+  McpServerInput,
+  McpTestResult,
+  McpTransport,
+} from '../api/types'
 
 interface FormState {
   name: string
@@ -42,6 +47,23 @@ function parseEnv(text: string): Record<string, string> {
     out[t.slice(0, idx).trim()] = t.slice(idx + 1).trim()
   }
   return out
+}
+
+/**
+ * args 数组 → textarea 文本（每行一个参数）。
+ * 相比空格拼接：可表达带空格/引号的单参数（如 ``--with mcp<2``、
+ * ``--config "some path"``），避免 ``split(/\s+/)`` 丢失引号分组。
+ */
+function argsToText(args: string[] | null | undefined): string {
+  return (args ?? []).join('\n')
+}
+
+/** textarea 文本 → args 数组（每行一个参数，去空行） */
+function parseArgs(text: string): string[] {
+  return text
+    .split('\n')
+    .map((t) => t.trim())
+    .filter(Boolean)
 }
 
 interface StatusMeta {
@@ -89,12 +111,15 @@ export function McpView() {
   const toggleMcp = useAppStore((s) => s.toggleMcp)
   const removeMcp = useAppStore((s) => s.removeMcp)
   const reconnectMcp = useAppStore((s) => s.reconnectMcp)
+  const testMcp = useAppStore((s) => s.testMcp)
 
   const [showForm, setShowForm] = useState(false)
   const [editing, setEditing] = useState<McpServerDto | null>(null)
   const [form, setForm] = useState<FormState>(EMPTY_FORM)
   const [formError, setFormError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState<McpTestResult | null>(null)
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
 
   useEffect(() => {
@@ -105,6 +130,7 @@ export function McpView() {
     setForm(EMPTY_FORM)
     setEditing(null)
     setFormError(null)
+    setTestResult(null)
   }
 
   function openCreate(): void {
@@ -122,13 +148,54 @@ export function McpView() {
       name: server.name,
       transport: server.transport,
       command: server.command ?? '',
-      args: (server.args ?? []).join(' '),
+      args: argsToText(server.args),
       url: server.url ?? '',
       env: envToText(server.env),
     })
     setEditing(server)
     setFormError(null)
+    setTestResult(null)
     setShowForm(true)
+  }
+
+  /** 从当前表单构造请求体（始终携带 name；编辑态提交时调用方去除 name） */
+  function buildInput(): McpServerInput {
+    const input: McpServerInput = {
+      name: form.name.trim(),
+      args: parseArgs(form.args),
+      command: form.transport === 'stdio' ? form.command.trim() : null,
+      url: form.transport === 'http' ? form.url.trim() : null,
+    }
+    const env = parseEnv(form.env)
+    if (Object.keys(env).length > 0) input.env = env
+    return input
+  }
+
+  async function handleTest(): Promise<void> {
+    const name = form.name.trim()
+    if (!name) {
+      setFormError('名称不能为空')
+      return
+    }
+    if (form.transport === 'stdio' && !form.command.trim()) {
+      setFormError('命令（command）不能为空')
+      return
+    }
+    if (form.transport === 'http' && !form.url.trim()) {
+      setFormError('URL 不能为空')
+      return
+    }
+    setTesting(true)
+    setTestResult(null)
+    setFormError(null)
+    try {
+      const result = await testMcp(buildInput())
+      setTestResult(result)
+    } catch (e) {
+      setFormError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setTesting(false)
+    }
   }
 
   async function handleSubmit(): Promise<void> {
@@ -148,37 +215,38 @@ export function McpView() {
     setSubmitting(true)
     setFormError(null)
     try {
-      const args = form.args.split(/\s+/).filter(Boolean)
-      const env = parseEnv(form.env)
+      let dto: McpServerDto
       if (editing) {
-        const patch: Partial<Omit<McpServerInput, 'name'>> = {
-          args,
-          command: form.transport === 'stdio' ? form.command.trim() : null,
-          url: form.transport === 'http' ? form.url.trim() : null,
-        }
+        const { name: _ignored, ...patch } = buildInput()
+        const typedPatch: Partial<Omit<McpServerInput, 'name'>> = patch
         // env 仍为掩码回显文本（未修改）时不发送，避免覆盖后端未变更项
         if (form.env.trim() !== '' && form.env !== envToText(editing.env)) {
-          patch.env = env
+          typedPatch.env = parseEnv(form.env)
         }
-        await updateMcp(name, patch)
-        toast('success', `已更新 MCP 服务器「${name}」`)
+        dto = await updateMcp(name, typedPatch)
+        echoStatus(dto, `已更新 MCP 服务器「${name}」`)
       } else {
-        const input: McpServerInput = {
-          name,
-          enabled: true,
-          args,
-          command: form.transport === 'stdio' ? form.command.trim() : null,
-          url: form.transport === 'http' ? form.url.trim() : null,
-        }
-        if (Object.keys(env).length > 0) input.env = env
-        await createMcp(input)
-        toast('success', `已添加 MCP 服务器「${name}」`)
+        const input: McpServerInput = buildInput()
+        input.enabled = true
+        dto = await createMcp(input)
+        echoStatus(dto, `已添加 MCP 服务器「${name}」`)
       }
       closeForm()
     } catch (e) {
       setFormError(e instanceof Error ? e.message : String(e))
     } finally {
       setSubmitting(false)
+    }
+  }
+
+  /** 保存成功后按返回的运行状态回显：connected → 工具数；error → 失败详情 */
+  function echoStatus(dto: McpServerDto, okMessage: string): void {
+    if (dto.status === 'connected') {
+      toast('success', `${okMessage}，已连接并注册 ${dto.tool_count} 个工具`)
+    } else if (dto.status === 'error') {
+      toast('error', `${okMessage}，但连接失败：${dto.error ?? '未知错误'}`)
+    } else {
+      toast('success', okMessage)
     }
   }
 
@@ -315,9 +383,10 @@ export function McpView() {
                     </label>
                     <label className="block">
                       <span className="section-label mb-1 block">参数（Args）</span>
-                      <input
-                        className="field-input font-mono"
-                        placeholder="空格分隔，如 -y @modelcontextprotocol/server-filesystem ."
+                      <textarea
+                        rows={4}
+                        className="field-input resize-y font-mono"
+                        placeholder={'每行一个参数\n如 -y\n@modelcontextprotocol/server-filesystem\n.'}
                         value={form.args}
                         onChange={(e) => setForm({ ...form, args: e.target.value })}
                       />
@@ -352,14 +421,54 @@ export function McpView() {
                   <div className="font-mono text-[11.5px] text-bloodx-400">{formError}</div>
                 )}
 
+                {/* 连接测试结果 */}
+                {testResult && (
+                  <div
+                    className={`rounded-md border px-2.5 py-2 font-mono text-[11px] leading-relaxed ${
+                      testResult.ok
+                        ? 'border-neon-500/30 bg-neon-500/[0.06] text-neon-400/90'
+                        : 'border-bloodx-500/30 bg-bloodx-500/[0.06] text-bloodx-400/90'
+                    }`}
+                  >
+                    {testResult.ok ? (
+                      <>
+                        <span className="text-neon-400">连接成功</span>
+                        {testResult.tools.length > 0 && (
+                          <span className="text-slate-500">，发现 {testResult.tools.length} 个工具：</span>
+                        )}
+                        {testResult.tools.length > 0 && (
+                          <div className="mt-1 space-y-0.5">
+                            {testResult.tools.slice(0, 8).map((t) => (
+                              <div key={t}>· {t}</div>
+                            ))}
+                            {testResult.tools.length > 8 && (
+                              <div className="text-slate-600">… 共 {testResult.tools.length} 个</div>
+                            )}
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <div className="whitespace-pre-wrap">连接失败：{testResult.error}</div>
+                    )}
+                  </div>
+                )}
+
                 <div className="flex justify-end gap-2">
+                  <button
+                    type="button"
+                    className="btn-ghost px-4 py-1.5 text-[12px]"
+                    disabled={testing || submitting}
+                    onClick={() => void handleTest()}
+                  >
+                    {testing ? '测试中…' : '测试连接'}
+                  </button>
                   <button type="button" className="btn-ghost px-4 py-1.5 text-[12px]" onClick={closeForm}>
                     取消
                   </button>
                   <button
                     type="button"
                     className="btn-primary px-4 py-1.5 text-[12px]"
-                    disabled={submitting}
+                    disabled={submitting || testing}
                     onClick={() => void handleSubmit()}
                   >
                     {submitting ? '提交中…' : editing ? '保存修改' : '添加'}

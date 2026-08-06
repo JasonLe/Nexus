@@ -99,6 +99,29 @@ def _mask_env(env: dict[str, str]) -> dict[str, str]:
     return {k: _mask_env_value(v) for k, v in env.items()}
 
 
+def _split_env_tokens(tokens: list[str]) -> tuple[list[str], dict[str, str]]:
+    """把 ``--env KEY=VALUE`` 从参数流中拆出，返回 (剩余 tokens, env)。
+
+    与 CLI REPL 的 /mcp add 约定一致：``--env`` 出现后，其后的
+    ``KEY=VALUE`` 对归 env，直到遇到下一个 ``--env`` 或结束。
+    """
+    rest: list[str] = []
+    env: dict[str, str] = {}
+    i = 0
+    while i < len(tokens):
+        if tokens[i] == "--env":
+            i += 1
+            while i < len(tokens) and "=" in tokens[i] and not tokens[i].startswith("--"):
+                key, _, value = tokens[i].partition("=")
+                if key:
+                    env[key] = value
+                i += 1
+            continue
+        rest.append(tokens[i])
+        i += 1
+    return rest, env
+
+
 def _config_to_json(config: NexusConfig) -> dict[str, Any]:
     """将 NexusConfig 序列化为 API 契约 JSON（api_key 脱敏）。"""
     providers: dict[str, Any] = {}
@@ -401,8 +424,10 @@ class _ChatConnection:
             )
 
         elif msg_type == "slash_command":
-            command = str(data.get("command", "")).lower().strip()
-            await self._handle_slash_command(command)
+            raw_command = str(data.get("command", "")).strip()
+            # 子命令匹配大小写不敏感，但参数（env 值、URL、包名）必须保真
+            command = raw_command.lower()
+            await self._handle_slash_command(raw_command)
 
         elif msg_type == "message":
             if self.running:
@@ -457,7 +482,8 @@ class _ChatConnection:
         /help   - 显示帮助信息
         /sessions - 列出历史会话
         """
-        if command == "/tools":
+        cmd_key = command.lower()
+        if cmd_key == "/tools":
             agent = self.current_agent
             tools = list(agent.tool_registry.list())
             tool_list = [
@@ -471,7 +497,7 @@ class _ChatConnection:
                 "content": tool_list,
             })
 
-        elif command == "/clear":
+        elif cmd_key == "/clear":
             self.history = []
             self.session_id = str(uuid.uuid4())[:_SESSION_ID_LENGTH]
             await self.ws.send_json({
@@ -481,7 +507,7 @@ class _ChatConnection:
                 "content": "对话历史已清除，可以开始新的对话。",
             })
 
-        elif command == "/help":
+        elif cmd_key == "/help":
             help_text = (
                 "**可用命令：**\n\n"
                 "- `/tools` — 列出当前已注册的工具\n"
@@ -497,7 +523,7 @@ class _ChatConnection:
                 "content": help_text,
             })
 
-        elif command == "/sessions":
+        elif cmd_key == "/sessions":
             sessions = self.session_manager.list_sessions()
             session_list = [
                 {
@@ -515,6 +541,9 @@ class _ChatConnection:
                 "content": session_list,
             })
 
+        elif cmd_key.startswith("/mcp"):
+            await self._handle_mcp_slash_command(command[4:].strip())
+
         else:
             await self.ws.send_json({
                 "type": "slash_command_result",
@@ -522,6 +551,233 @@ class _ChatConnection:
                 "title": "未知命令",
                 "content": f"未知命令: {command}，输入 /help 查看帮助",
             })
+
+    async def _handle_mcp_slash_command(self, args: str) -> None:
+        """处理 /mcp 子命令（与 CLI REPL 的 /mcp 行为一致）。
+
+        支持：
+        - ``/mcp [list]`` —— 列出所有 server 与连接状态
+        - ``/mcp tools <name>`` —— 列出该 server 的远端工具
+        - ``/mcp show <name>`` —— 显示单 server 完整配置（含掩码 env）
+        - ``/mcp add <name> <command> [args...]`` / ``--url <url>``
+        - ``/mcp remove <name>`` / ``/mcp enable <name>`` / ``/mcp disable <name>``
+        - ``/mcp reconnect <name>``
+
+        热生效路径与 CLI 相同：修改 ``app.state.config.mcp_servers`` →
+        持久化 → 全量重载 MCP 插件。
+        """
+        from nexus.cli.config import MCPServerConfig
+        from nexus.core.factory import install_mcp
+
+        async def result(title: str, content: Any) -> None:
+            await self.ws.send_json({
+                "type": "slash_command_result",
+                "command": f"/mcp {args}".strip(),
+                "title": title,
+                "content": content,
+            })
+
+        app = self.app
+        cfg: NexusConfig = app.state.config
+        tokens = args.split()
+        sub = tokens[0].lower() if tokens else "list"
+
+        # 插件可能尚未安装（首次无 enabled server）；需要时再安装
+        async def _ensure_plugin():
+            plugin = app.state.agent.plugin_registry.get("mcp")
+            if plugin is None:
+                from nexus.server.app import _get_mcp_plugin
+                plugin = await _get_mcp_plugin(app)
+            return plugin
+
+        async def _reload() -> None:
+            from nexus.server.app import _reload_mcp
+            await _reload_mcp(app)
+
+        async def _save() -> None:
+            try:
+                save_config(cfg, path=app.state.config_save_path)
+            except Exception as exc:
+                await result("配置保存失败", f"保存失败: {exc}")
+
+        async def _status_list() -> list[dict[str, Any]]:
+            """合并 manager 运行时状态 + 配置中未接管的条目。"""
+            plugin = await _ensure_plugin()
+            status_list = plugin.manager.get_status() if plugin is not None else []
+            known = {s["name"] for s in status_list}
+            for name, sc in cfg.mcp_servers.items():
+                if name in known:
+                    continue
+                status_list.append({
+                    "name": name,
+                    "transport": sc.transport,
+                    "enabled": sc.enabled,
+                    "status": "disabled" if not sc.enabled else "disconnected",
+                    "error": None,
+                    "tool_count": 0,
+                    "tools": [],
+                })
+            return status_list
+
+        if sub == "list":
+            status_list = await _status_list()
+            lines = []
+            for s in status_list:
+                mark = "✓" if s["enabled"] else "✗"
+                err = f" ({s['error'][:60]})" if s.get("error") else ""
+                lines.append(
+                    f"{mark} {s['name']} [{s['transport']}] {s['status']} · "
+                    f"{s['tool_count']} 工具{err}"
+                )
+            await result(
+                "MCP Servers",
+                "\n".join(lines) if lines else "（暂无 MCP server，使用 /mcp add 添加）",
+            )
+
+        elif sub == "tools":
+            if len(tokens) != 2:
+                await result("用法", "/mcp tools <名称>")
+                return
+            name = tokens[1]
+            status_list = await _status_list()
+            status = next((s for s in status_list if s["name"] == name), None)
+            if status is None:
+                await result("未找到", f"MCP server '{name}' 不存在")
+                return
+            tools = status.get("tools", [])
+            if not tools:
+                await result(f"工具 · {name}", "（暂无已注册的工具）")
+                return
+            lines = [f"- {t['name']}: {t.get('description', '')}" for t in tools]
+            await result(f"工具 · {name}", "\n".join(lines))
+
+        elif sub == "show":
+            if len(tokens) != 2:
+                await result("用法", "/mcp show <名称>")
+                return
+            name = tokens[1]
+            sc = cfg.mcp_servers.get(name)
+            if sc is None:
+                await result("未找到", f"MCP server '{name}' 不存在")
+                return
+            status_list = await _status_list()
+            status = next((s for s in status_list if s["name"] == name), {})
+            from nexus.server.app import _mask_env
+            lines = [
+                f"名称: {name}",
+                f"类型: {sc.transport}",
+                f"启用: {'是' if sc.enabled else '否'}",
+                f"命令: {sc.command or ''}",
+                f"参数: {' '.join(sc.args) or '（无）'}",
+                f"URL: {sc.url or '（无）'}",
+            ]
+            if sc.env:
+                for k, v in _mask_env(sc.env).items():
+                    lines.append(f"env {k}={v}")
+            lines.append(f"状态: {status.get('status', 'unknown')}")
+            if status.get("error"):
+                lines.append(f"错误: {status['error']}")
+            await result(f"详情 · {name}", "\n".join(lines))
+
+        elif sub == "add":
+            if len(tokens) < 3:
+                await result("用法", "/mcp add <名称> <命令> [参数...] [--env K=V]... 或 /mcp add <名称> --url <url>")
+                return
+            name = tokens[1]
+            if name in cfg.mcp_servers:
+                await result("已存在", f"MCP server '{name}' 已存在")
+                return
+            cmd_tokens, env = _split_env_tokens(tokens[2:])
+            if cmd_tokens and cmd_tokens[0] == "--url":
+                if len(cmd_tokens) != 2:
+                    await result("用法", "/mcp add <名称> --url <url>")
+                    return
+                new_cfg = MCPServerConfig(url=cmd_tokens[1], env=env)
+            elif cmd_tokens:
+                new_cfg = MCPServerConfig(
+                    command=cmd_tokens[0], args=cmd_tokens[1:], env=env,
+                )
+            else:
+                await result("用法", "/mcp add <名称> <命令> [参数...]")
+                return
+            cfg.mcp_servers[name] = new_cfg
+            await _save()
+            await _reload()
+            status_list = await _status_list()
+            status = next((s for s in status_list if s["name"] == name), None)
+            if status and status["status"] == "connected":
+                await result("已添加", f"已添加并连接 '{name}'，注册 {status['tool_count']} 个工具")
+            elif status and status["status"] == "error":
+                await result("已添加但连接失败", f"'{name}' 已保存但连接失败:\n{status['error']}")
+            else:
+                await result("已添加", f"已添加 MCP server '{name}'")
+
+        elif sub == "remove":
+            if len(tokens) != 2:
+                await result("用法", "/mcp remove <名称>")
+                return
+            name = tokens[1]
+            if name not in cfg.mcp_servers:
+                await result("未找到", f"MCP server '{name}' 不存在")
+                return
+            plugin = await _ensure_plugin()
+            if plugin is not None:
+                await plugin.manager.remove(name, app.state.agent.tool_registry)
+            del cfg.mcp_servers[name]
+            await _save()
+            await result("已移除", f"已移除 MCP server '{name}'")
+
+        elif sub in ("enable", "disable"):
+            if len(tokens) != 2:
+                await result("用法", f"/mcp {sub} <名称>")
+                return
+            name = tokens[1]
+            sc = cfg.mcp_servers.get(name)
+            if sc is None:
+                await result("未找到", f"MCP server '{name}' 不存在")
+                return
+            sc.enabled = sub == "enable"
+            await _save()
+            await _reload()
+            if sc.enabled:
+                status_list = await _status_list()
+                status = next((s for s in status_list if s["name"] == name), None)
+                if status and status["status"] == "connected":
+                    await result("已启用", f"已启用 '{name}'，注册 {status['tool_count']} 个工具")
+                elif status and status["status"] == "error":
+                    await result("已启用但连接失败", f"'{name}' 已启用但连接失败:\n{status['error']}")
+                else:
+                    await result("已启用", f"已启用 MCP server '{name}'")
+            else:
+                await result("已禁用", f"已禁用 MCP server '{name}'，工具已注销")
+
+        elif sub == "reconnect":
+            if len(tokens) != 2:
+                await result("用法", "/mcp reconnect <名称>")
+                return
+            name = tokens[1]
+            plugin = await _ensure_plugin()
+            if plugin is None:
+                await result("无法重连", "MCP 插件未安装（当前无启用的 server）")
+                return
+            ok = await plugin.manager.reconnect(name, app.state.agent.tool_registry)
+            if ok:
+                status = next(
+                    (s for s in plugin.manager.get_status() if s["name"] == name),
+                    None,
+                )
+                count = status["tool_count"] if status else 0
+                await result("已重连", f"已重连 '{name}'，注册 {count} 个工具")
+            else:
+                status = next(
+                    (s for s in plugin.manager.get_status() if s["name"] == name),
+                    None,
+                )
+                err = status.get("error") if status else None
+                await result("重连失败", err or f"重连 '{name}' 失败")
+
+        else:
+            await result("未知子命令", f"未知 /mcp 子命令: {sub}，输入 /mcp 查看用法")
 
     async def _run(self, content: str) -> None:
         """执行一轮 Agent.run，期间订阅 EventBus 推送流式事件。
@@ -899,6 +1155,65 @@ def create_app(
         await _reload_mcp(request.app)
         return await _mcp_status_item(request.app, name)
 
+    @app.post("/api/mcp/test")
+    async def test_mcp_server(request: Request) -> dict[str, Any]:
+        """测试 MCP server 配置（不持久化、不注册工具）。
+
+        与 create/update 不同：只创建临时 MCPClient 建连并拉取工具列表，
+        成功返回 ``{"ok": True, "tools": [name...]}``，失败返回
+        ``{"ok": False, "error": <详细错误>}``。Desktop 表单「测试连接」
+        按钮用；CLI 未来可复用。
+        """
+        from nexus.cli.config import MCPServerConfig
+        from nexus.tools.mcp.client import MCP_SDK_AVAILABLE, MCPClient
+
+        if not MCP_SDK_AVAILABLE:
+            raise HTTPException(
+                status_code=400,
+                detail='MCP SDK 未安装，请运行 pip install -e ".[mcp]"',
+            )
+
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="请求体不是合法 JSON")
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+
+        command = data.get("command")
+        url = data.get("url")
+        if not command and not url:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": "command 与 url 至少提供一个"},
+            )
+
+        # 复用 create 的解析逻辑构造临时配置（不写入 config.mcp_servers）
+        tmp_cfg = MCPServerConfig(
+            command=str(command) if command else None,
+            args=[str(a) for a in (data.get("args") or [])],
+            env={str(k): str(v) for k, v in (data.get("env") or {}).items()},
+            url=str(url) if url else None,
+        )
+        client = MCPClient(
+            name=data.get("name") or "test",
+            command=tmp_cfg.command,
+            args=tmp_cfg.args,
+            env=tmp_cfg.env,
+            url=tmp_cfg.url,
+        )
+        try:
+            await client.connect()
+            remote_tools = await client.list_tools()
+        except Exception as exc:
+            await client.close()
+            return JSONResponse({"ok": False, "error": str(exc)})
+        await client.close()
+        return {
+            "ok": True,
+            "tools": [t["name"] for t in remote_tools],
+        }
+
     @app.put("/api/mcp/{name}")
     async def update_mcp_server(request: Request, name: str) -> dict[str, Any]:
         """更新 MCP server 配置子集并热重载（env 支持掩码回传）。"""
@@ -969,11 +1284,14 @@ def create_app(
         if not ok:
             state = await _mcp_status_item(request.app, name)
             error = state.get("error") if state else None
+            error = error or f"MCP server '{name}' 重连失败"
             return JSONResponse(
                 status_code=500,
                 content={
                     "ok": False,
-                    "error": error or f"MCP server '{name}' 重连失败",
+                    "error": error,
+                    # detail 与 REST 错误体一致，便于前端 request() 统一解析
+                    "detail": error,
                 },
             )
         return JSONResponse({"ok": True})

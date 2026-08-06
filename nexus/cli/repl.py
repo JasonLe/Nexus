@@ -623,12 +623,18 @@ class Repl:
             "用法:\n"
             "  /mcp [list]                         列出所有 MCP server\n"
             "  /mcp tools <名称>                   列出该 server 的远端工具\n"
+            "  /mcp show <名称>                    显示单 server 完整配置与错误详情\n"
             "  /mcp add <名称> <命令> [参数...]    添加 stdio server\n"
+            "        [--env KEY=VALUE]...          可追加多个环境变量\n"
             "  /mcp add <名称> --url <url>         添加 http server\n"
+            "  /mcp edit <名称> <命令> [参数...]   修改 stdio server 的命令与参数\n"
+            "        [--env KEY=VALUE]...          合并/更新环境变量\n"
+            "  /mcp edit <名称> --url <url>        修改 http server 的 URL\n"
             "  /mcp remove <名称>                  移除 server（断开并注销工具）\n"
             "  /mcp enable <名称>                  启用 server（重连并注册工具）\n"
             "  /mcp disable <名称>                 禁用 server（断开并注销工具）\n"
-            "  /mcp reconnect <名称>               重连 server 并刷新工具"
+            "  /mcp reconnect <名称>               重连 server 并刷新工具\n\n"
+            "提示：env 值支持 ${VAR} / ${VAR:-default} 环境变量引用。"
         )
 
     def _get_mcp_plugin(self) -> Any | None:
@@ -681,7 +687,17 @@ class Repl:
                 "error": None,
                 "tool_count": 0,
                 "tools": [],
+                "command": cfg.command,
+                "args": list(cfg.args),
+                "url": cfg.url,
             })
+        # manager.get_status() 不携带配置字段，补上以便列表展示命令列
+        for item in status_list:
+            cfg = self.config.mcp_servers.get(item["name"])
+            if cfg is not None:
+                item.setdefault("command", cfg.command)
+                item.setdefault("args", list(cfg.args))
+                item.setdefault("url", cfg.url)
         return status_list
 
     async def _handle_mcp_command(self, args: str) -> None:
@@ -702,6 +718,45 @@ class Repl:
         """
         from nexus.cli.config import MCPServerConfig
 
+        def _split_env(tokens: list[str]) -> tuple[list[str], dict[str, str]]:
+            """把 ``--env KEY=VALUE`` 从参数流中拆出，返回 (剩余 tokens, env)。
+
+            约定：``--env`` 出现后，其后的 ``KEY=VALUE`` 对归 env，
+            直到遇到下一个 ``--env`` 或结束。便于 ``/mcp add minimax uvx
+            --from pkg --with mcp<2 pkg --env MINIMAX_API_KEY=sk-xxx``。
+            """
+            rest: list[str] = []
+            env: dict[str, str] = {}
+            i = 0
+            while i < len(tokens):
+                if tokens[i] == "--env":
+                    i += 1
+                    while i < len(tokens) and "=" in tokens[i] and not tokens[i].startswith("--"):
+                        key, _, value = tokens[i].partition("=")
+                        if key:
+                            env[key] = value
+                        i += 1
+                    continue
+                rest.append(tokens[i])
+                i += 1
+            return rest, env
+
+        async def _connect_and_echo(name: str) -> None:
+            """连接后按状态回显（add / edit / enable 共用）。"""
+            status = next(
+                (s for s in self._mcp_status_list() if s["name"] == name), None,
+            )
+            if status and status["status"] == "connected":
+                self.display.show_info(
+                    f"已连接 '{name}'，注册 {status['tool_count']} 个工具"
+                )
+            elif status and status["status"] == "error":
+                self.display.render_warning(
+                    f"已保存但连接失败: {status['error']}"
+                )
+            else:
+                self.display.show_info(f"已保存 MCP server '{name}'")
+
         tokens = args.split()
         sub = tokens[0].lower() if tokens else "list"
 
@@ -721,6 +776,20 @@ class Repl:
                 return
             self.display.render_mcp_tools(name, status.get("tools", []))
 
+        elif sub == "show":
+            if len(tokens) != 2:
+                self.display.show_info(self._mcp_usage())
+                return
+            name = tokens[1]
+            cfg = self.config.mcp_servers.get(name)
+            if cfg is None:
+                self.display.render_warning(f"未找到 MCP server: {name}")
+                return
+            status = next(
+                (s for s in self._mcp_status_list() if s["name"] == name), {},
+            )
+            self.display.render_mcp_detail(name, cfg, status)
+
         elif sub == "add":
             if len(tokens) < 3:
                 self.display.show_info(self._mcp_usage())
@@ -729,33 +798,61 @@ class Repl:
             if name in self.config.mcp_servers:
                 self.display.render_warning(f"MCP server 已存在: {name}")
                 return
-            if tokens[2] == "--url":
+            cmd_tokens, env = _split_env(tokens[2:])
+            if cmd_tokens and cmd_tokens[0] == "--url":
                 # http 模式：/mcp add <名称> --url <url>
-                if len(tokens) != 4:
+                if len(cmd_tokens) != 2:
                     self.display.show_info(self._mcp_usage())
                     return
-                cfg = MCPServerConfig(url=tokens[3])
-            else:
+                cfg = MCPServerConfig(url=cmd_tokens[1], env=env)
+            elif cmd_tokens:
                 # stdio 模式：/mcp add <名称> <命令> [参数...]
-                cfg = MCPServerConfig(command=tokens[2], args=tokens[3:])
+                cfg = MCPServerConfig(
+                    command=cmd_tokens[0], args=cmd_tokens[1:], env=env,
+                )
+            else:
+                self.display.show_info(self._mcp_usage())
+                return
             self.config.mcp_servers[name] = cfg
             self._save_config_quietly()
             self.display.show_info(f"正在连接 MCP server '{name}'...")
             await self._reload_or_install_mcp()
-            status = next(
-                (s for s in self._mcp_status_list() if s["name"] == name), None,
-            )
-            if status and status["status"] == "connected":
-                self.display.show_info(
-                    f"已添加 MCP server '{name}'，注册 {status['tool_count']} 个工具"
-                )
-            elif status and status["status"] == "error":
-                self.display.render_warning(
-                    f"MCP server '{name}' 已保存但连接失败: {status['error']}"
-                )
-            else:
-                self.display.show_info(f"已添加 MCP server '{name}'")
+            await _connect_and_echo(name)
             logger.info("MCP server added via /mcp add", extra={"name": name})
+
+        elif sub == "edit":
+            if len(tokens) < 3:
+                self.display.show_info(self._mcp_usage())
+                return
+            name = tokens[1]
+            cfg = self.config.mcp_servers.get(name)
+            if cfg is None:
+                self.display.render_warning(f"未找到 MCP server: {name}")
+                return
+            cmd_tokens, env = _split_env(tokens[2:])
+            if cmd_tokens and cmd_tokens[0] == "--url":
+                # http 模式：/mcp edit <名称> --url <url>
+                if len(cmd_tokens) != 2:
+                    self.display.show_info(self._mcp_usage())
+                    return
+                cfg.command = None
+                cfg.args = []
+                cfg.url = cmd_tokens[1]
+            elif cmd_tokens:
+                # stdio 模式：/mcp edit <名称> <命令> [参数...]
+                cfg.command = cmd_tokens[0]
+                cfg.args = cmd_tokens[1:]
+                cfg.url = None
+            else:
+                self.display.show_info(self._mcp_usage())
+                return
+            if env:
+                cfg.env.update(env)
+            self._save_config_quietly()
+            self.display.show_info(f"正在重连 MCP server '{name}'...")
+            await self._reload_or_install_mcp()
+            await _connect_and_echo(name)
+            logger.info("MCP server edited via /mcp edit", extra={"name": name})
 
         elif sub == "remove":
             if len(tokens) != 2:

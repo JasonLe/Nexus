@@ -463,3 +463,115 @@ class TestRenderHelpPanel:
         assert "Esc+Enter" in output
         assert "中断当前任务" in output
 
+
+class TestRenderMcpServers:
+    """测试 MCP server 列表表格渲染。"""
+
+    def test_empty_list_guides_add(self, display):
+        """空列表应提示 /mcp add 用法。"""
+        display.render_mcp_servers([])
+        output = _get_output(display)
+        assert "暂无 MCP server" in output
+        assert "/mcp add" in output
+
+    def test_list_shows_command_column(self, display):
+        """列表应包含命令列（command + args）。"""
+        display.render_mcp_servers([
+            {
+                "name": "fs",
+                "transport": "stdio",
+                "enabled": True,
+                "status": "connected",
+                "error": None,
+                "tool_count": 3,
+                "command": "npx",
+                "args": ["-y", "pkg"],
+                "url": None,
+            },
+        ])
+        output = _get_output(display)
+        assert "fs" in output
+        assert "npx" in output
+        assert "connected" in output
+
+    def test_list_shows_error_summary(self, display):
+        """error 状态应附截断的错误摘要。"""
+        display.render_mcp_servers([
+            {
+                "name": "bad",
+                "transport": "stdio",
+                "enabled": True,
+                "status": "error",
+                "error": "MCP server 'bad' 启动失败：子进程在握手前退出，stderr 尾部: " + "x" * 100,
+                "tool_count": 0,
+                "command": "pkg",
+                "args": [],
+                "url": None,
+            },
+        ])
+        output = _get_output(display)
+        assert "bad" in output
+        assert "error" in output
+        # 错误摘要保留（Rich 列宽截断可能用 …，故不断言具体截断字符）
+        assert "启动失败" in output
+
+
+class TestRenderMcpDetail:
+    """测试 /mcp show 的单 server 详情渲染。"""
+
+    def test_detail_shows_full_error(self, display):
+        """详情应显示完整（不截断）错误。"""
+        from nexus.cli.config import MCPServerConfig
+
+        cfg = MCPServerConfig(
+            command="pkg",
+            args=["--with", "mcp<2", "pkg"],
+            env={"MINIMAX_API_KEY": "sk-very-secret-value-12345678"},
+            enabled=True,
+        )
+        error_msg = "长错误 " * 50
+        display.render_mcp_detail("mm", cfg, {"status": "error", "error": error_msg})
+        output = _get_output(display)
+        assert "mm" in output
+        assert "--with" in output
+        assert "MINIMAX_API_KEY" in output
+        # env 值被掩码：明文不应出现在输出
+        assert "sk-very-secret-value-12345678" not in output
+        # 完整错误保留（Rich 表格会换行折叠，按片段断言即可覆盖）
+        assert "长错误 " in output
+        assert "长错误 长错误 长错误 长错误 长错误" in " ".join(output.split())
+        assert "sk-very-secret-value-12345678" not in output
+
+    def test_detail_http_mode(self, display):
+        """http 模式显示 URL。"""
+        from nexus.cli.config import MCPServerConfig
+
+        cfg = MCPServerConfig(url="http://localhost:3000/mcp")
+        display.render_mcp_detail("remote", cfg, {"status": "disconnected", "error": None})
+        output = _get_output(display)
+        assert "http://localhost:3000/mcp" in output
+        assert "disconnected" in output
+
+
+class TestMaskSecret:
+    """测试 _mask_secret 掩码规则。"""
+
+    def test_mask_long_value(self, display):
+        """长值保留前3后4。"""
+        from nexus.cli.display import _mask_secret
+
+        # sk-abcdefghijkl：前3 = "sk-"，后4 = "ijkl"
+        assert _mask_secret("sk-abcdefghijkl") == "sk-****ijkl"
+
+    def test_mask_short_value(self, display):
+        """短值全掩码。"""
+        from nexus.cli.display import _mask_secret
+
+        assert _mask_secret("abc") == "****"
+
+    def test_mask_empty(self, display):
+        """空值返回空串。"""
+        from nexus.cli.display import _mask_secret
+
+        assert _mask_secret("") == ""
+

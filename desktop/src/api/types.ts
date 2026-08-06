@@ -105,6 +105,13 @@ export interface McpServerInput {
   enabled?: boolean
 }
 
+/** POST /api/mcp/test 返回：连接测试结果（不持久化） */
+export interface McpTestResult {
+  ok: boolean
+  tools: string[]
+  error: string | null
+}
+
 // ---- WebSocket 消息契约类型 ----
 
 export type WsClientMessage =

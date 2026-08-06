@@ -38,6 +38,19 @@ logger = get_logger(__name__)
 _THINKING_SPINNER = Spinner("dots", text="Thinking...", style="dim")
 
 
+def _mask_secret(value: str) -> str:
+    """对敏感值应用前3后4掩码（与 server 端 _mask_env_value 规则一致）。
+
+    保留前 3 位与后 4 位，中间以 **** 代替，如 ``sk-****abcd``；
+    过短的值直接返回 ``****``。用于 /mcp show 的 env 展示，避免 token 泄露。
+    """
+    if not value:
+        return ""
+    if len(value) <= 7:
+        return "****"
+    return f"{value[:3]}****{value[-4:]}"
+
+
 class DisplayManager:
     """终端显示管理器 —— 封装 Rich 组件的流式渲染。
 
@@ -763,6 +776,7 @@ class DisplayManager:
         table.add_column("启用", justify="center")
         table.add_column("状态")
         table.add_column("工具数", justify="right")
+        table.add_column("命令", style="dim", overflow="fold")
 
         for item in status_list:
             status = str(item.get("status", "unknown"))
@@ -774,12 +788,21 @@ class DisplayManager:
                 if len(error_str) > 40:
                     error_str = error_str[:37] + "..."
                 status_text.append(f" ({error_str})", style="red")
+            cmd = item.get("command") or ""
+            if cmd:
+                args = item.get("args") or []
+                cmd = f"{cmd} {' '.join(args)}" if args else cmd
+            elif item.get("url"):
+                cmd = item.get("url")
+            else:
+                cmd = "-"
             table.add_row(
                 str(item.get("name", "unknown")),
                 str(item.get("transport", "stdio")),
                 "✓" if item.get("enabled") else "✗",
                 status_text,
                 str(item.get("tool_count", 0)),
+                cmd,
             )
 
         self.console.print(table)
@@ -821,6 +844,81 @@ class DisplayManager:
         logger.info(
             "MCP tools table rendered",
             extra={"server": server_name, "count": len(tools)},
+        )
+
+    def render_mcp_detail(
+        self,
+        server_name: str,
+        cfg: Any,
+        status: dict[str, Any],
+    ) -> None:
+        """渲染单个 MCP server 的完整配置与运行状态（/mcp show <名称>）。
+
+        与列表不同，这里完整展示 command / args / env（掩码）/ url /
+        enabled / status / error（不截断），便于排查连接失败原因。
+
+        Parameters
+        ----------
+        server_name : str
+            server 名称。
+        cfg : Any
+            MCPServerConfig 实例（duck-typed：command/args/env/url/enabled）。
+        status : dict[str, Any]
+            运行状态（manager.get_status() 项或空 dict）。
+        """
+        from nexus.cli.config import MCPServerConfig
+
+        if not isinstance(cfg, MCPServerConfig):
+            cfg = MCPServerConfig(
+                command=getattr(cfg, "command", None),
+                args=list(getattr(cfg, "args", None) or []),
+                env=dict(getattr(cfg, "env", None) or {}),
+                url=getattr(cfg, "url", None),
+                enabled=bool(getattr(cfg, "enabled", True)),
+            )
+
+        status_text = str(status.get("status", "unknown"))
+        style = "green" if status_text == "connected" else (
+            "red" if status_text == "error" else (
+                "dim" if status_text == "disabled" else "yellow"
+            )
+        )
+
+        lines = [
+            f"名称: {server_name}",
+            f"类型: {cfg.transport}",
+            f"启用: {'✓' if cfg.enabled else '✗'}",
+            f"状态: {status_text}",
+        ]
+        if cfg.command:
+            lines.append(f"命令: {cfg.command}")
+        if cfg.args:
+            lines.append(f"参数: {' '.join(cfg.args)}")
+        if cfg.url:
+            lines.append(f"URL: {cfg.url}")
+        # env 掩码展示（避免 token 泄露）
+        if cfg.env:
+            lines.append("环境变量:（掩码展示）")
+            for k, v in cfg.env.items():
+                lines.append(f"env {k}: {_mask_secret(v)}")
+        error = status.get("error")
+        if error:
+            lines.append("")
+            lines.append(f"错误详情: {error}")
+
+        table = Table(
+            title=f"MCP 详情 · {server_name}", show_lines=True, border_style="cyan",
+        )
+        table.add_column("项", style="bold cyan", no_wrap=True)
+        table.add_column("值", overflow="fold")
+        for line in lines:
+            key, _, value = line.partition(": ")
+            if value or key == "错误详情":
+                table.add_row(key, value)
+        self.console.print(table)
+        logger.info(
+            "MCP detail rendered",
+            extra={"server": server_name, "status": status_text},
         )
 
     @staticmethod

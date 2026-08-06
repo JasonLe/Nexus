@@ -568,3 +568,111 @@ class TestMcpApi:
         for t in tools:
             assert t["origin"] == "builtin"
             assert t["server"] is None
+
+
+class TestMcpTestApi:
+    """POST /api/mcp/test：连接测试（不持久化、不注册工具）。"""
+
+    def test_test_bad_command_returns_error(self, server_env):
+        """不存在的命令 → 200 + ok=False + 详细错误（含 stderr 尾部）。"""
+        client = TestClient(server_env["app"])
+        resp = client.post(
+            "/api/mcp/test",
+            json={"name": "x", "command": "nexus-no-such-cmd-xyz", "args": []},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is False
+        assert "stderr" in data["error"] or "启动失败" in data["error"]
+
+    def test_test_missing_command_and_url(self, server_env):
+        """command 与 url 都缺 → 400 + ok=False。"""
+        client = TestClient(server_env["app"])
+        resp = client.post("/api/mcp/test", json={"name": "x"})
+        assert resp.status_code == 400
+        assert resp.json()["ok"] is False
+
+    def test_test_does_not_persist(self, server_env):
+        """test 不写入配置：GET /api/mcp 仍为空。"""
+        client = TestClient(server_env["app"])
+        client.post(
+            "/api/mcp/test",
+            json={"name": "ghost", "command": "nexus-no-such-cmd-xyz"},
+        )
+        assert client.get("/api/mcp").json() == []
+
+    def test_test_bad_json(self, server_env):
+        """请求体非 JSON → 400。"""
+        client = TestClient(server_env["app"])
+        resp = client.post(
+            "/api/mcp/test", content="not-json",
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 400
+
+
+class TestMcpSlashCommand:
+    """WS /ws/chat 的 /mcp 斜杠命令。"""
+
+    def test_slash_mcp_list_empty(self, server_env):
+        """/mcp list：空配置返回空提示。"""
+        client = TestClient(server_env["app"])
+        with client.websocket_connect("/ws/chat") as ws:
+            ws.send_json({"type": "slash_command", "command": "/mcp"})
+            msg = ws.receive_json()
+            assert msg["type"] == "slash_command_result"
+            assert "暂无" in msg["content"]
+
+    def test_slash_mcp_add_preserves_case(self, server_env, no_mcp_connect):
+        """/mcp add 支持 --env 且保留大小写；随后 GET /api/mcp 可见。"""
+        client = TestClient(server_env["app"])
+        with client.websocket_connect("/ws/chat") as ws:
+            ws.send_json({
+                "type": "slash_command",
+                "command": "/mcp add t1 pkg --env MINIMAX_API_KEY=sk-UPPER --env MyKey=Val",
+            })
+            msg = ws.receive_json()
+            assert msg["type"] == "slash_command_result"
+
+        got = client.get("/api/mcp").json()
+        t1 = next(s for s in got if s["name"] == "t1")
+        assert t1["command"] == "pkg"
+        # env 掩码回显，但 key 大小写必须保留
+        assert "MINIMAX_API_KEY" in t1["env"]
+        assert "MyKey" in t1["env"]
+
+    def test_slash_mcp_show(self, server_env, no_mcp_connect):
+        """/mcp show：显示完整配置与错误详情。"""
+        client = TestClient(server_env["app"])
+        client.post("/api/mcp", json={"name": "t1", "command": "pkg"})
+        with client.websocket_connect("/ws/chat") as ws:
+            ws.send_json({"type": "slash_command", "command": "/mcp show t1"})
+            msg = ws.receive_json()
+            assert msg["title"].startswith("详情")
+            assert "命令: pkg" in msg["content"]
+
+    def test_slash_mcp_remove(self, server_env, no_mcp_connect):
+        """/mcp remove：配置移除。"""
+        client = TestClient(server_env["app"])
+        client.post("/api/mcp", json={"name": "t1", "command": "pkg"})
+        with client.websocket_connect("/ws/chat") as ws:
+            ws.send_json({"type": "slash_command", "command": "/mcp remove t1"})
+            msg = ws.receive_json()
+            assert "已移除" in msg["content"]
+        assert client.get("/api/mcp").json() == []
+
+    def test_slash_mcp_unknown_subcommand(self, server_env):
+        """未知子命令 → 提示用法。"""
+        client = TestClient(server_env["app"])
+        with client.websocket_connect("/ws/chat") as ws:
+            ws.send_json({"type": "slash_command", "command": "/mcp bogus x"})
+            msg = ws.receive_json()
+            assert "未知 /mcp 子命令" in msg["content"]
+
+    def test_slash_tools_case_insensitive(self, server_env):
+        """/TOOLS 大写也能命中（子命令匹配大小写不敏感）。"""
+        client = TestClient(server_env["app"])
+        with client.websocket_connect("/ws/chat") as ws:
+            ws.send_json({"type": "slash_command", "command": "/TOOLS"})
+            msg = ws.receive_json()
+            assert msg["title"] == "已注册工具"

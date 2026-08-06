@@ -2,6 +2,7 @@ import type {
   HealthInfo,
   McpServerDto,
   McpServerInput,
+  McpTestResult,
   NexusConfigDto,
   SessionDetail,
   SessionSummary,
@@ -39,6 +40,8 @@ export const api = {
   listMcp: () => request<McpServerDto[]>('/mcp'),
   createMcp: (input: McpServerInput) =>
     request<McpServerDto>('/mcp', { method: 'POST', body: JSON.stringify(input) }),
+  testMcp: (input: McpServerInput) =>
+    request<McpTestResult>('/mcp/test', { method: 'POST', body: JSON.stringify(input) }),
   updateMcp: (name: string, patch: Partial<Omit<McpServerInput, 'name'>>) =>
     request<McpServerDto>(`/mcp/${encodeURIComponent(name)}`, {
       method: 'PUT',
